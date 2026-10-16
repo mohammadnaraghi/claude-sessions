@@ -77,15 +77,15 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/claude-sessions/main/cs"
 CLAUDE_DIR = os.environ.get("CS_CLAUDE_DIR") or os.path.expanduser("~/.claude")  # override for tests
 PROJECTS = os.path.join(CLAUDE_DIR, "projects")
-CACHE_DIR = os.path.expanduser("~/.cache/claude-sessions")
+CACHE_DIR = os.environ.get("CS_CACHE_DIR") or os.path.expanduser("~/.cache/claude-sessions")
 CACHE = os.path.join(CACHE_DIR, "cache.json")
 CACHE_VERSION = 4
 HOSTS_FILE = os.path.expanduser("~/.config/cs/hosts")
-HOME = os.path.expanduser("~")
+HOME = os.environ.get("CS_HOME") or os.path.expanduser("~")  # override for tests
 HOME_RE = re.compile(r"^/(?:Users|home)/[^/]+")
 GAP = 30 * 60  # silence longer than this is not counted as work
 CRON_LIFETIME = timedelta(days=7)  # recurring in-session jobs auto-expire after this

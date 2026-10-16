@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="856" height="511" viewBox="0 0 856 511" font-family="SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12.6">
+<rect width="856" height="511" rx="10" fill="#1e1e2e"/>
+<path d="M10 0h836a10 10 0 0 1 10 10v28H0V10A10 10 0 0 1 10 0z" fill="#181825"/>
+<circle cx="20" cy="19" r="6" fill="#ff5f57"/><circle cx="40" cy="19" r="6" fill="#febc2e"/><circle cx="60" cy="19" r="6" fill="#28c840"/>
+<text x="428.0" y="24" text-anchor="middle" fill="#7f849c" font-size="12">cs live</text>
+<text y="70"><tspan x="18.0" fill="#a6e3a1" xml:space="preserve">●</tspan><tspan x="33.2" fill="#ffffff" font-weight="600" xml:space="preserve">webapp-12</tspan><tspan x="124.4" fill="#7f849c" xml:space="preserve">~/code/webapp</tspan></text>
+<text y="89"><tspan x="40.8" fill="#7f849c" xml:space="preserve">name</tspan><tspan x="94.0" fill="#cdd6f4" xml:space="preserve">Checkout flow A/B test</tspan></text>
+<text y="108"><tspan x="40.8" fill="#a6e3a1" xml:space="preserve">busy</tspan><tspan x="78.8" fill="#cdd6f4" xml:space="preserve">for 12m · context 62k tokens</tspan></text>
+<text y="127"><tspan x="40.8" fill="#7f849c" xml:space="preserve">asked</tspan><tspan x="94.0" fill="#cdd6f4" xml:space="preserve">compare conversion between the two variants over the full week</tspan></text>
+<text y="146"><tspan x="40.8" fill="#7f849c" xml:space="preserve">doing</tspan><tspan x="94.0" fill="#cdd6f4" xml:space="preserve">Bash: Run the checkout integration tests</tspan></text>
+<text y="165"><tspan x="40.8" fill="#7f849c" xml:space="preserve">said</tspan><tspan x="94.0" fill="#cdd6f4" xml:space="preserve">Pulling the full week now. Variant B still leads on mobile; checking whether Safari drop-offs exp…</tspan></text>
+<text y="184"><tspan x="40.8" fill="#7f849c" xml:space="preserve">todo</tspan><tspan x="94.0" fill="#cdd6f4" xml:space="preserve">5/8 done (62%) · now: Writing the significance test</tspan></text>
+<text y="203"></text>
+<text y="222"><tspan x="18.0" fill="#a6e3a1" xml:space="preserve">●</tspan><tspan x="33.2" fill="#ffffff" font-weight="600" xml:space="preserve">takeoff-3</tspan><tspan x="109.2" fill="#cba6f7" xml:space="preserve">@studio</tspan><tspan x="177.6" fill="#7f849c" xml:space="preserve">~/ml/takeoff</tspan></text>
+<text y="241"><tspan x="40.8" fill="#7f849c" xml:space="preserve">name</tspan><tspan x="94.0" fill="#cdd6f4" xml:space="preserve">Blueprint takeoff model</tspan></text>
+<text y="260"><tspan x="40.8" fill="#a6e3a1" xml:space="preserve">busy</tspan><tspan x="78.8" fill="#cdd6f4" xml:space="preserve">for 40m · context 266k tokens · tmux main:1.0</tspan></text>
+<text y="279"><tspan x="40.8" fill="#7f849c" xml:space="preserve">asked</tspan><tspan x="94.0" fill="#cdd6f4" xml:space="preserve">explain each arm of the a/b</tspan></text>
+<text y="298"><tspan x="40.8" fill="#7f849c" xml:space="preserve">doing</tspan><tspan x="94.0" fill="#cdd6f4" xml:space="preserve">Bash: Evaluate arm C on the sealed split</tspan></text>
+<text y="317"><tspan x="40.8" fill="#7f849c" xml:space="preserve">said</tspan><tspan x="94.0" fill="#cdd6f4" xml:space="preserve">Three arms, assigned at random per upload: A is the old vector plan, B adds seeded rows, C adds s…</tspan></text>
+<text y="336"><tspan x="40.8" fill="#7f849c" xml:space="preserve">cron</tspan><tspan x="94.0" fill="#cdd6f4" xml:space="preserve">◦ once Oct 17 09:20 · </tspan><tspan x="261.2" fill="#f9e2af" font-weight="600" xml:space="preserve">waiting</tspan></text>
+<text y="355"><tspan x="40.8" fill="#7f849c" xml:space="preserve">cron</tspan><tspan x="94.0" fill="#cdd6f4" xml:space="preserve">↻ Every day at 9:30 AM · fires 2/7 (28%) · last Oct 16 09:30 · </tspan><tspan x="572.8" fill="#a6e3a1" font-weight="600" xml:space="preserve">live</tspan><tspan x="610.8" fill="#cdd6f4" xml:space="preserve">· expires Oct 21 18:30</tspan></text>
+<text y="374"></text>
+<text y="393"><tspan x="18.0" fill="#f9e2af" xml:space="preserve">●</tspan><tspan x="33.2" fill="#ffffff" font-weight="600" xml:space="preserve">api-7</tspan><tspan x="94.0" fill="#7f849c" xml:space="preserve">~/code/api</tspan></text>
+<text y="412"><tspan x="40.8" fill="#7f849c" xml:space="preserve">name</tspan><tspan x="94.0" fill="#cdd6f4" xml:space="preserve">Nightly usage report</tspan></text>
+<text y="431"><tspan x="40.8" fill="#f9e2af" xml:space="preserve">idle</tspan><tspan x="78.8" fill="#cdd6f4" xml:space="preserve">since 1h · context 63k tokens</tspan></text>
+<text y="450"><tspan x="40.8" fill="#7f849c" xml:space="preserve">asked</tspan><tspan x="94.0" fill="#cdd6f4" xml:space="preserve">also flag any customer whose errors doubled</tspan></text>
+<text y="469"><tspan x="40.8" fill="#7f849c" xml:space="preserve">said</tspan><tspan x="94.0" fill="#cdd6f4" xml:space="preserve">Added: customers whose error rate doubled day over day get a warning line. The 9:03 job picks it …</tspan></text>
+<text y="488"><tspan x="40.8" fill="#7f849c" xml:space="preserve">cron</tspan><tspan x="94.0" fill="#cdd6f4" xml:space="preserve">↻ Every day at 9:03 AM · fires 3/7 (42%) · last Oct 15 09:03 · </tspan><tspan x="572.8" fill="#a6e3a1" font-weight="600" xml:space="preserve">live</tspan><tspan x="610.8" fill="#cdd6f4" xml:space="preserve">· expires Oct 20 18:00</tspan></text>
+</svg>

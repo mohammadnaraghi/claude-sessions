@@ -1,173 +1,171 @@
-# claude-sessions
+<h1 align="center">cs</h1>
 
-`cs` finds and resumes any [Claude Code](https://claude.com/claude-code) session from one place.
+<p align="center">
+  Find, watch and resume every <a href="https://claude.com/claude-code">Claude Code</a> session you have, on every machine you own.
+</p>
 
-Claude Code's own `claude --resume` only shows sessions started in the folder you are in.
-`cs` scans every project folder, measures how much real work each session had, shows what it
-was about, and resumes the one you pick: it `cd`s into the session's directory and runs
-`claude --resume <id>` for you.
+<p align="center">
+  <img alt="macOS and Linux" src="https://img.shields.io/badge/macOS%20%C2%B7%20Linux-supported-2ea44f">
+  <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-3776ab">
+  <img alt="No dependencies" src="https://img.shields.io/badge/dependencies-none-2ea44f">
+  <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-lightgrey">
+</p>
 
-```
-  #        last       work   session                              project        last prompt
-  1   ●    12m ago    3.4h   Checkout flow A/B test               web            compare conversion between variants
-  2    ↻   2h ago    29.0h   TikTok attribution                   api            add lookalike audiences to the campaign
-  3        1d ago     1.1h   Mandatory Expo updates               mobile         generate the update log for this release
-  4   ●↻   2d ago    14.0h   Unresolved support issues            slackbot       set up the daily parse as a cron job
-  5        3d ago     45m    LogRocket removal                    mobile         remove it everywhere and open a PR
+<p align="center">
+  <img src="docs/picker.svg" width="100%" alt="The cs picker: every session on every machine in one list">
+</p>
 
-32 sessions · page 1/4 · n / p to page · number = resume · s # = details · /text = filter · q = quit · ● running · ↻ cron
->
-```
+Claude Code keeps each session inside the folder it was started in, so `claude --resume` only
+ever shows you one folder's worth. `cs` puts all of them in one list: what each session was
+about, how much real work went into it, which ones are running right now, and which ones have
+scheduled jobs ticking inside them. Type a number and you are back in that session, even when
+it lives on another computer.
 
-`●` marks a session that is running right now (green busy, yellow idle) and `↻` one that set up
-cron jobs (green while a job is still live). `cs live` shows what the running ones are doing:
+## Highlights
 
-```
-● slackbot-59  ~/slackbot
-   name   Unresolved support issues
-   busy for 2m · context 466k tokens
-   asked  full audit of this PR, check the reviewer bot comments
-   doing  Bash: run the search fuzz tests
-   said   Lint is clean now. Redoing the three commits, pushing, and opening the PR.
-   todo   3/8 done (37%) · now: write the fuzz test
-   cron   ↻ Every day at 7:13 AM · fires 2/7 (28%) · last Oct 16 07:13 · live · expires Oct 21 11:33
-```
+- **One list for everything.** Every project, newest first, with the session's name, the hours
+  you actually spent in it, and the last thing you asked. Filter by typing.
+- **See what is running.** `cs live` shows each open session: busy or idle, what you asked,
+  what it is doing this second, the last thing it said, and how far through its checklist it is.
+- **Scheduled jobs, tracked.** Sessions that set up cron jobs are marked. You see the schedule,
+  how many times it has fired, and whether it is still alive or died with the terminal.
+- **Your other computers too.** Add a machine once; its sessions join the list. Resuming one
+  opens it there over ssh. Sessions running inside tmux are attached, not duplicated.
+- **Memories and settings travel with you.** Keep two machines in step with one command,
+  in both directions, with a plan shown first and backups kept.
+- **Private by design.** One Python file, no dependencies, no accounts, no servers. It reads
+  what Claude Code already stores on your disk and talks only to machines you name.
 
-Single Python file, no dependencies, nothing leaves your machines.
-
-## Other machines over ssh
-
-Sessions live on the computer that ran them, so `cs` can ask your other machines and show
-everything in one list. It needs key-based ssh that works without a prompt.
-
-```sh
-cs hosts add studio user@studio.local   # label, then the ssh destination
-cs hosts setup studio                   # copies cs to that machine
-cs hosts                                # check each host: reachable, cs version, tmux
-```
-
-From then on `cs`, `cs live` and `cs jobs` include that host, with a host column in the list.
-Picking a remote session runs `claude --resume` there through `ssh -t`. If the session is
-already running inside a tmux window, `cs` attaches to that window instead of starting a
-second copy, on either machine. `--local` skips the hosts, `--host label=dest` adds one for a
-single run, and `cs hosts rm studio` removes one.
-
-Keeping long-running sessions in tmux on an always-on machine is the setup this is built
-for: the session, and any cron jobs inside it, survive closing your laptop, and you attach
-from anywhere with one keystroke in `cs`.
-
-## Memories and configs between machines
-
-Claude Code keeps what it learns about you and your projects on the machine it ran on:
-the `memory` folders under `~/.claude/projects`, plus your settings. `cs sync` keeps two
-machines in step, in both directions:
-
-```sh
-cs sync studio -n        # dry run: shows exactly what would change on each side
-cs sync studio           # shows the plan and asks before applying
-cs migrate to studio     # new machine: copy everything from here, nothing deleted
-cs migrate from studio   # the other way round
-```
-
-What travels: every project's memory folder, `settings.json`, `CLAUDE.md`,
-`keybindings.json`, your `commands`, `agents`, `hooks` and `skills` folders (minus the
-account-managed `skills/synced`), and the MCP server definitions from `~/.claude.json`.
-Transcripts, credentials, caches and session state stay where they are.
-
-How conflicts are settled:
-
-- A file that exists on one side only is copied to the other.
-- A file that differs on both sides goes to the newer copy, or to the side you name with
-  `--prefer local` / `--prefer remote`.
-- `settings.json` and the MCP server list are merged key by key, with lists unioned, so a
-  permission added on one machine and a model changed on the other both survive.
-- Each project's `MEMORY.md` index is merged so no memory loses its entry.
-- A file you deleted on one machine since the last sync is deleted on the other, as long
-  as the other copy was not changed in the meantime. `migrate` never deletes.
-- Anything replaced or removed is first copied to `~/.claude/backups/cs-sync-<time>/`.
-
-`--memory` or `--configs` limits a run to one group. A different username on the other
-machine is fine: project folders are matched by their path relative to each home.
-
-## Install (macOS and Linux)
+## Install
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/mohammadnaraghi/claude-sessions/main/install.sh | sh
 ```
 
-This puts one file at `~/.local/bin/cs`, adds that directory to your `PATH` if it is not
-already there, and needs only `python3` (3.8 or newer) plus Claude Code itself. Open a new
-shell afterwards and type `cs`.
+That is the whole setup. It needs `python3` and Claude Code, puts one file in `~/.local/bin`,
+and tells you if that folder is not on your `PATH` yet. Open a new terminal and type `cs`.
 
-- Update later with `cs update`
-- Uninstall with `rm ~/.local/bin/cs && rm -r ~/.cache/claude-sessions`
-- Prefer a different directory: `CS_BIN_DIR=/usr/local/bin sh install.sh`
+- Update any time with `cs update`
+- Remove with `rm ~/.local/bin/cs`
 
-If [fzf](https://github.com/junegunn/fzf) is installed, `cs` uses it automatically for fuzzy
-search with a live preview of each session.
+If you have [fzf](https://github.com/junegunn/fzf) installed, `cs` uses it automatically for
+fuzzy search with a live preview.
 
-## Usage
+## What is running right now
 
+<p align="center">
+  <img src="docs/live.svg" width="100%" alt="cs live: open sessions, what they are doing, and their jobs">
+</p>
+
+`cs live` is the view you want when you come back to your desk. For every open session, on
+every machine, it tells you what you asked for, which command it is running, what it last
+reported, and the checklist progress when the session keeps one. Scheduled jobs that are still
+alive are listed underneath.
+
+## Scheduled jobs
+
+<p align="center">
+  <img src="docs/jobs.svg" width="100%" alt="cs jobs: every scheduled job and whether it is alive">
+</p>
+
+Jobs scheduled inside a Claude Code session only run while that session is open, and they stop
+after a week. That is easy to forget. `cs jobs` lists every job you ever set up with its
+schedule, how many of its possible runs have happened, and a plain status: live, waiting,
+done, expired, cancelled, or dead because the terminal closed.
+
+## Every detail of a session
+
+<p align="center">
+  <img src="docs/show.svg" width="100%" alt="cs show: the full picture of one session">
+</p>
+
+`cs show 2` gives you the full picture before you jump in: when it started, how the work was
+spread across days, the first and latest prompts, its jobs, and the exact command that resumes
+it.
+
+## Your other computers
+
+```sh
+cs hosts add studio sam@studio.local   # a name you choose, then the ssh address
+cs hosts setup studio                  # copies cs over, done
 ```
-cs                     interactive picker (last 14 days, sessions with 10+ min of work)
-cs 3                   resume the 3rd session in that list
-cs tiktok              filter by text; resumes directly on a single match
-                       (the words "running" and "cron" filter by status)
-cs show 3              details: per-day work, prompts, live status, cron jobs
-cs live                running sessions: what they are doing and how far along
-cs jobs                every in-session cron job with fires, last fire and status
-cs path 3              print the session's directory, so  cd "$(cs path 3)"  works
-cs -p                  print the list and exit (every row when piped)
-cs update              replace the script with the latest release
-```
 
-Inside the picker, type a number to resume, `s 3` for details, `/text` to filter,
-`n` / `p` to page, and `q` to quit. The list is sized to your terminal, so it never scrolls.
+<p align="center">
+  <img src="docs/hosts.svg" width="100%" alt="cs hosts: each machine, reachable, ready">
+</p>
 
-Options:
+From then on the other machine's sessions sit in the same list with a host column, and
+`cs live` and `cs jobs` cover it as well. Picking one of its sessions resumes it there through
+ssh. If that session is already running inside a tmux window, `cs` attaches you to that
+window instead of starting a second copy. Add as many machines as you like, Mac or Linux, any
+names you want. It needs ssh with keys, the normal setup between your own machines.
 
-```
--d, --days N           look back N days (default 14)
--m, --min N            minimum active minutes to be listed (default 10)
--a, --all              list every session touched in the window
---sort recent|active   order by last activity (default) or by hours worked
---local                this machine only, skip configured hosts
---host LABEL=DEST      query this host too (or only, together with --local)
---json                 machine-readable output
--n, --dry-run          print the resume command instead of running it
---rescan               rebuild the cache from scratch
---no-fzf               use the built-in picker even if fzf is installed
--- ARGS                pass ARGS to claude, e.g.  cs 2 -- --model opus
-```
+A tip: keep long-running sessions in tmux on an always-on machine. The session and its
+scheduled jobs survive closing your laptop, and `cs` gets you back to them from anywhere.
 
-## How it works
+## Keep two machines in sync
 
-- Reads the transcripts Claude Code already keeps in `~/.claude/projects/<project>/<session>.jsonl`.
-- **Work time** adds up the gaps between consecutive messages, ignoring any pause longer
-  than 30 minutes, so a session left open overnight does not count as a night of work.
-- **Session name** is the title you set with `/rename`, otherwise the title Claude Code
-  generates automatically, otherwise the first prompt.
-- **Last prompt** is the last thing you asked, skipping one or two word replies like "yes".
-- **Running** sessions come from the per-process files Claude Code keeps in `~/.claude/sessions`
-  (checked against live pids). For those, `cs live` reads the end of the transcript: the last
-  prompt, the tool call still waiting for a result, the last status line Claude wrote, the
-  context size, and the todo list if the session keeps one. Sessions started through Remote
-  Control or as background workers also expose a state line and the PRs they opened.
-- **Cron jobs** are the `CronCreate` calls a session made. Each fire is a prompt tagged as
-  scheduled, so `cs` counts fires against the fires possible in the job's 7-day lifetime.
-  A job is `live` only while its session is still running; once the terminal closes it shows
-  as `dead`, and `expired` or `cancelled` when that happened first.
-- Results are cached in `~/.cache/claude-sessions/cache.json` and updated incrementally, so
-  the first run takes a few seconds and later runs are instant.
+<p align="center">
+  <img src="docs/sync.svg" width="100%" alt="cs sync: the plan for both machines, before anything changes">
+</p>
 
-Resuming runs the real `claude --resume` in the session's original directory, so anything that
-worked in the session keeps working.
+Claude Code learns things about you and your projects as you work, and keeps them on the
+machine you were using. `cs sync studio` carries that knowledge, plus your settings, across
+both machines in both directions:
+
+- what Claude remembers about each project, and about you
+- your settings, instructions, key bindings, custom commands, agents, hooks and skills
+- your MCP server list
+
+Nothing changes until you have seen the plan and said yes. Newer copies win, settings and
+memory indexes are merged rather than overwritten, something you deleted on one machine is
+removed from the other, and everything replaced is kept in a dated backup folder first.
+Setting up a brand new machine is `cs migrate to studio`, which copies everything over and
+deletes nothing.
+
+## Cheat sheet
+
+| Command | What it does |
+|---|---|
+| `cs` | the picker: last two weeks, newest first |
+| `cs 3` | resume number 3 |
+| `cs tiktok` | filter by any word; resumes at once if only one matches |
+| `cs running` · `cs cron` · `cs @studio` | only running sessions, only sessions with jobs, only one machine |
+| `cs live` | what every open session is doing |
+| `cs jobs` | every scheduled job and its status |
+| `cs show 3` | the full story of one session |
+| `cs hosts add NAME user@host` | add another machine, then `cs hosts setup NAME` |
+| `cs sync NAME` | two-way sync of memories and settings, `-n` for a dry run |
+| `cs migrate to NAME` | set up a new machine from this one |
+| `cs -d 30` · `cs -a` | look back 30 days · show every session, however short |
+| `cs 3 -- --model opus` | pass extra flags to Claude Code |
+
+Inside the picker: a number resumes, `s 3` shows details, `/text` filters, `n` and `p` page,
+`q` quits.
+
+## Questions
+
+**Does anything leave my machine?** No. There is no account, no server and no telemetry. The
+only network traffic is ssh to machines you added yourself, and the update check when you run
+`cs update`.
+
+**I use more than one Claude account.** That is fine. Sessions are files on your disk, not
+tied to an account, so `cs` sees all of them and resumes any of them.
+
+**Will it slow things down?** The first run reads your history once, a few seconds. After that
+it opens instantly, and asking another machine adds well under a second.
+
+**Can I name my machines whatever I want?** Yes. The name is just a label you type; the ssh
+address can be a hostname, an IP, or an alias from your ssh config.
+
+**Does resuming change anything?** No. `cs` runs the same `claude --resume` you would type
+yourself, in the session's own folder.
 
 ## Requirements
 
 - macOS or Linux
-- Python 3.8+
-- Claude Code (the `claude` command on your `PATH`)
+- Python 3.8 or newer, which both already have
+- Claude Code
 
 ## License
 
