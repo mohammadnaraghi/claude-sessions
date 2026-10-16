@@ -28,6 +28,22 @@ Other machines (over ssh, key auth)
   Resuming one runs claude there over ssh -t, or attaches to its tmux
   window when the session is already running inside tmux.
 
+Memories and configs between machines
+  cs sync studio                 two-way sync of Claude's memory folders and
+                                 your configs (settings.json, CLAUDE.md,
+                                 keybindings, commands, agents, hooks, skills,
+                                 MCP servers). Newest copy wins per file;
+                                 settings and memory indexes are merged;
+                                 a file deleted on one side since the last
+                                 sync is deleted on the other. Shows the plan
+                                 and asks before changing anything; replaced
+                                 files are kept under ~/.claude/backups.
+  cs migrate to studio           copy everything here onto a new machine
+  cs migrate from studio         the other way round (no deletions either way)
+  --memory | --configs           only one of the two groups
+  --prefer local|remote          who wins conflicts (default: newest)
+  -n                             dry run      -y   apply without asking
+
 Options
   -d, --days N           look back N days (default 14)
   -m, --min N            minimum active minutes to be listed (default 10)
@@ -61,9 +77,9 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/claude-sessions/main/cs"
-CLAUDE_DIR = os.path.expanduser("~/.claude")
+CLAUDE_DIR = os.environ.get("CS_CLAUDE_DIR") or os.path.expanduser("~/.claude")  # override for tests
 PROJECTS = os.path.join(CLAUDE_DIR, "projects")
 CACHE_DIR = os.path.expanduser("~/.cache/claude-sessions")
 CACHE = os.path.join(CACHE_DIR, "cache.json")
@@ -746,6 +762,403 @@ def hosts_cmd(args, hosts):
         sys.exit("usage: cs hosts | cs hosts add LABEL user@host | cs hosts setup LABEL | cs hosts rm LABEL")
 
 
+# ----------------------------------------------------------------- sync (memories + configs)
+
+SYNC_STATE_DIR = os.path.expanduser("~/.config/cs/sync")
+BACKUP_ROOT = os.path.join(CLAUDE_DIR, "backups")
+CONFIG_FILES = ("settings.json", "CLAUDE.md", "keybindings.json")
+CONFIG_DIRS = ("commands", "agents", "hooks", "skills")
+SYNC_SKIP_DIRS = ("skills/synced",)  # managed by your claude.ai account, not by you
+SYNC_MAX_FILE = 2_000_000
+MCP_FILE = "mcp-servers.json"  # the mcpServers section of ~/.claude.json, as its own file
+JUNK_PROJECTS = ("-private-tmp", "-tmp", "-var-folders", "-private-var")
+
+
+def encode_path(p):
+    """How Claude Code names a project folder under ~/.claude/projects."""
+    return re.sub(r"[^A-Za-z0-9]", "-", p)
+
+
+def logical_project(dirname, home):
+    """projects/<dirname> -> 'HOME-rest' so the same project matches on a machine with another home."""
+    enc = encode_path(home)
+    if dirname == enc:
+        return "HOME"
+    if dirname.startswith(enc + "-"):
+        return "HOME" + dirname[len(enc):]
+    if dirname == "-" or dirname.startswith(JUNK_PROJECTS):
+        return None
+    return dirname
+
+
+def physical_project(logical, home):
+    enc = encode_path(home)
+    if logical == "HOME":
+        return enc
+    if logical.startswith("HOME-"):
+        return enc + logical[4:]
+    return logical
+
+
+def physical_path(logical):
+    if logical.startswith("memory/"):
+        _, proj, rest = logical.split("/", 2)
+        return os.path.join(PROJECTS, physical_project(proj, HOME), "memory", rest)
+    return os.path.join(CLAUDE_DIR, logical)
+
+
+def pretty_logical(logical):
+    return logical.replace("memory/HOME", "memory/~", 1)
+
+
+def sync_paths(items):
+    """logical path -> absolute path for everything on this machine that takes part in a sync."""
+    out = {}
+    if "configs" in items:
+        for f in CONFIG_FILES:
+            p = os.path.join(CLAUDE_DIR, f)
+            if os.path.isfile(p):
+                out[f] = p
+        for d in CONFIG_DIRS:
+            for root, dirs, files in os.walk(os.path.join(CLAUDE_DIR, d)):
+                rel = os.path.relpath(root, CLAUDE_DIR)
+                if any(rel == s or rel.startswith(s + "/") for s in SYNC_SKIP_DIRS):
+                    dirs[:] = []
+                    continue
+                for fn in files:
+                    p = os.path.join(root, fn)
+                    if not fn.startswith(".") and os.path.getsize(p) <= SYNC_MAX_FILE:
+                        out[os.path.join(rel, fn)] = p
+    if "memory" in items and os.path.isdir(PROJECTS):
+        for ent in os.scandir(PROJECTS):
+            mem = os.path.join(ent.path, "memory")
+            if not ent.is_dir() or not os.path.isdir(mem):
+                continue
+            lp = logical_project(ent.name, HOME)
+            if lp is None:
+                continue
+            for root, _, files in os.walk(mem):
+                for fn in files:
+                    p = os.path.join(root, fn)
+                    if not fn.startswith(".") and os.path.getsize(p) <= SYNC_MAX_FILE:
+                        out["memory/" + lp + "/" + os.path.relpath(p, mem)] = p
+    return out
+
+
+def claude_json_path():
+    return os.environ.get("CS_CLAUDE_JSON") or os.path.expanduser("~/.claude.json")
+
+
+def mcp_bytes():
+    """The MCP server definitions as a stable JSON document, or None if there is no ~/.claude.json."""
+    try:
+        with open(claude_json_path()) as f:
+            servers = json.load(f).get("mcpServers") or {}
+    except (OSError, ValueError):
+        return None
+    return (json.dumps(servers, indent=1, sort_keys=True) + "\n").encode()
+
+
+def sha(data):
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
+def local_snapshot(items):
+    """{logical: {"hash", "mtime", "data"}} for this machine."""
+    snap = {}
+    for logical, p in sync_paths(items).items():
+        with open(p, "rb") as f:
+            data = f.read()
+        snap[logical] = {"hash": sha(data), "mtime": os.path.getmtime(p), "data": data}
+    if "configs" in items:
+        data = mcp_bytes()
+        if data is not None:
+            snap[MCP_FILE] = {"hash": sha(data), "mtime": os.path.getmtime(claude_json_path()), "data": data}
+    return snap
+
+
+def pack(files, extra=None):
+    """tar.gz bytes: files/<logical> for each entry (with its mtime) plus optional small JSON members."""
+    import io
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, data in (extra or {}).items():
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            ti.mtime = int(datetime.now().timestamp())
+            tar.addfile(ti, io.BytesIO(data))
+        for logical, entry in files.items():
+            ti = tarfile.TarInfo("files/" + logical)
+            ti.size = len(entry["data"])
+            ti.mtime = int(entry.get("mtime") or datetime.now().timestamp())
+            tar.addfile(ti, io.BytesIO(entry["data"]))
+    return buf.getvalue()
+
+
+def unpack(data):
+    """-> (extra members as {name: bytes}, files as {logical: {"hash", "mtime", "data"}})."""
+    import io
+    import tarfile
+    extra, files = {}, {}
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+        for m in tar.getmembers():
+            if not m.isfile():
+                continue
+            body = tar.extractfile(m).read()
+            if m.name.startswith("files/"):
+                files[m.name[6:]] = {"hash": sha(body), "mtime": float(m.mtime), "data": body}
+            else:
+                extra[m.name] = body
+    return extra, files
+
+
+def apply_changes(writes, deletes):
+    """Write and delete on this machine, keeping a copy of anything replaced under ~/.claude/backups."""
+    stamp = datetime.now().strftime("cs-sync-%Y%m%d-%H%M%S")
+    backup = os.path.join(BACKUP_ROOT, stamp)
+    result = {"written": [], "deleted": [], "backup": None}
+
+    def keep(path, logical):
+        if os.path.exists(path):
+            dst = os.path.join(backup, logical)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(path, dst)
+            result["backup"] = backup
+
+    def put(path, data, mtime):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".cs-tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+        if mtime:
+            os.utime(path, (mtime, mtime))
+
+    for logical, entry in writes.items():
+        if logical == MCP_FILE:
+            p = claude_json_path()
+            keep(p, "claude.json")
+            try:
+                with open(p) as f:
+                    o = json.load(f)
+            except (OSError, ValueError):
+                o = {}
+            o["mcpServers"] = json.loads(entry["data"])
+            put(p, (json.dumps(o, indent=2) + "\n").encode(), None)
+        else:
+            p = physical_path(logical)
+            keep(p, logical)
+            put(p, entry["data"], entry.get("mtime"))
+        result["written"].append(logical)
+    for logical in deletes:
+        p = physical_path(logical)
+        if os.path.exists(p):
+            keep(p, logical)
+            os.remove(p)
+            result["deleted"].append(logical)
+    return result
+
+
+def merge_json(a, b, prefer_a):
+    """Deep merge: dict keys unioned, lists unioned in order, scalar conflicts go to the winner."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        first, second = (a, b) if prefer_a else (b, a)
+        out = {}
+        for k in list(first) + [k for k in second if k not in first]:
+            out[k] = merge_json(a[k], b[k], prefer_a) if k in a and k in b else (a.get(k) if k in a else b[k])
+        return out
+    if isinstance(a, list) and isinstance(b, list):
+        first, second = (a, b) if prefer_a else (b, a)
+        return list(first) + [x for x in second if x not in first]
+    return a if prefer_a else b
+
+
+def merge_index(a, b, prefer_a):
+    """MEMORY.md indexes: keep every bullet, deduped by the file it links to, winner's order first."""
+    first, second = (a, b) if prefer_a else (b, a)
+    lines, seen = [], set()
+    for text in (first, second):
+        for line in text.decode(errors="replace").splitlines():
+            key = re.search(r"\]\(([^)]+)\)", line)
+            key = key.group(1) if key else (line.strip() if line.strip() else None)
+            if key is not None and key in seen:
+                continue
+            if text is second and not line.startswith("-"):
+                continue  # headers and prose come from the winner only
+            if key is not None:
+                seen.add(key)
+            lines.append(line)
+    return ("\n".join(lines).rstrip("\n") + "\n").encode()
+
+
+def merge_entry(logical, le, re_, prefer_local):
+    """Merged bytes for the few files that should be combined instead of overwritten, else None."""
+    if logical in ("settings.json", MCP_FILE):
+        try:
+            merged = merge_json(json.loads(le["data"]), json.loads(re_["data"]), prefer_local)
+        except ValueError:
+            return None
+        return (json.dumps(merged, indent=2 if logical == "settings.json" else 1,
+                           sort_keys=logical == MCP_FILE) + "\n").encode()
+    if logical.startswith("memory/") and logical.endswith("/MEMORY.md"):
+        return merge_index(le["data"], re_["data"], prefer_local)
+    return None
+
+
+def state_path(label):
+    return os.path.join(SYNC_STATE_DIR, re.sub(r"[^A-Za-z0-9_.-]", "_", label) + ".json")
+
+
+def plan_sync(local, remote, state, prefer, allow_delete, label):
+    """Decide per file. -> (local_writes, local_deletes, remote_writes, remote_deletes, lines, same)."""
+    lw, ld, rw, rd, lines, same = {}, [], {}, [], [], 0
+    for logical in sorted(set(local) | set(remote)):
+        le, re_ = local.get(logical), remote.get(logical)
+        shown = pretty_logical(logical)
+        if le and re_:
+            if le["hash"] == re_["hash"]:
+                same += 1
+                continue
+            local_wins = prefer == "local" or (prefer == "newest" and le["mtime"] >= re_["mtime"])
+            merged = merge_entry(logical, le, re_, local_wins)
+            if merged is not None:
+                entry = {"data": merged, "mtime": max(le["mtime"], re_["mtime"]), "hash": sha(merged)}
+                if entry["hash"] != le["hash"]:
+                    lw[logical] = entry
+                if entry["hash"] != re_["hash"]:
+                    rw[logical] = entry
+                lines.append(("merge", shown, "both sides differ, combined" +
+                              ("" if prefer == "newest" else f", {prefer} wins conflicts")))
+            elif local_wins:
+                rw[logical] = le
+                why = "local wins" if prefer == "local" else f"newer here ({when_ts(le['mtime'])} vs {when_ts(re_['mtime'])})"
+                lines.append(("push", shown, why))
+            else:
+                lw[logical] = re_
+                why = f"{label} wins" if prefer == "remote" else f"newer there ({when_ts(re_['mtime'])} vs {when_ts(le['mtime'])})"
+                lines.append(("pull", shown, why))
+        elif le:
+            if allow_delete and state.get(logical) == le["hash"] and prefer != "local":
+                ld.append(logical)
+                lines.append(("delete here", shown, f"removed on {label} since the last sync"))
+            else:
+                rw[logical] = le
+                lines.append(("push", shown, "only here"))
+        else:
+            if allow_delete and state.get(logical) == re_["hash"] and prefer != "remote":
+                rd.append(logical)
+                lines.append((f"delete on {label}", shown, "removed here since the last sync"))
+            else:
+                lw[logical] = re_
+                lines.append(("pull", shown, f"only on {label}"))
+    return lw, ld, rw, rd, lines, same
+
+
+def when_ts(t):
+    return datetime.fromtimestamp(t).strftime("%b %d %H:%M")
+
+
+ACTION_STYLE = {"push": ("→", "32"), "pull": ("←", "36"), "merge": ("⇄", "33")}
+
+
+def sync_cmd(label, dest, items, prefer, dry, yes, allow_delete, title):
+    try:
+        p = subprocess.run(["ssh", *SSH_OPTS, dest, f"{REMOTE_CS} _export --items {','.join(items)}"],
+                           capture_output=True, timeout=120)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        sys.exit(f"{label}: {e}")
+    if p.returncode != 0:
+        err = p.stderr.decode(errors="replace").strip().splitlines() or ["ssh failed"]
+        sys.exit(f"{label}: {err[-1]}\n(an older cs there? run: cs hosts setup {label})")
+    try:
+        extra, remote = unpack(p.stdout)
+        manifest = json.loads(extra["manifest.json"])
+    except (KeyError, ValueError, OSError):
+        sys.exit(f"{label}: unexpected reply, run: cs hosts setup {label}")
+    local = local_snapshot(items)
+    try:
+        with open(state_path(label)) as f:
+            state = json.load(f).get("files", {})
+    except (OSError, ValueError):
+        state = {}
+    lw, ld, rw, rd, lines, same = plan_sync(local, remote, state, prefer, allow_delete, label)
+    what = " + ".join(items)
+    print(c("1", f"{title} {label}") + c("2", f"  ({what}; their home {manifest.get('home')}; "
+                                               f"{len(local)} files here, {len(remote)} there)"))
+    cols, _ = term()
+    width = min(max([20] + [len(s) for _, s, _ in lines]), max(30, cols - 60))
+    for action, shown, why in lines:
+        sym, col = ACTION_STYLE.get(action.split()[0], ("✕", "31"))
+        print(f"  {c(col, sym + ' ' + action.ljust(16))} {fit(shown, width).ljust(width)}  {c('2', why)}")
+    print(c("2", f"  = {same} files identical"))
+    if not lines:
+        print("nothing to do")
+        return
+    if dry:
+        print(c("2", "dry run, nothing changed"))
+        return
+    if not yes:
+        if not sys.stdin.isatty():
+            sys.exit("not applying without -y (no terminal to confirm)")
+        try:
+            ans = input(c("1", f"apply {len(lines)} changes? [y/N] ")).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if ans not in ("y", "yes"):
+            print("cancelled")
+            return
+    if rw or rd:
+        payload = pack(rw, {"plan.json": json.dumps({"deletes": rd}).encode()})
+        try:
+            q = subprocess.run(["ssh", *SSH_OPTS, dest, f"{REMOTE_CS} _import"], input=payload,
+                               capture_output=True, timeout=120)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            sys.exit(f"{label}: {e}")
+        if q.returncode != 0:
+            sys.exit(f"{label}: import failed: {q.stderr.decode(errors='replace').strip()[-300:]}")
+        try:
+            rres = json.loads(q.stdout.decode())
+        except ValueError:
+            sys.exit(f"{label}: import gave no result")
+        print(f"{label}: wrote {len(rres['written'])}, removed {len(rres['deleted'])}"
+              + (f", backups in {rres['backup']}" if rres.get("backup") else ""))
+    if lw or ld:
+        lres = apply_changes(lw, ld)
+        print(f"here: wrote {len(lres['written'])}, removed {len(lres['deleted'])}"
+              + (f", backups in {lres['backup']}" if lres.get("backup") else ""))
+    final = {}
+    for logical, e in local.items():
+        if logical not in ld:
+            final[logical] = e["hash"]
+    for logical, e in remote.items():
+        if logical not in rd and logical not in final:
+            final[logical] = e["hash"]
+    for logical, e in list(lw.items()) + list(rw.items()):
+        final[logical] = e["hash"]
+    os.makedirs(SYNC_STATE_DIR, exist_ok=True)
+    with open(state_path(label), "w") as f:
+        json.dump({"at": datetime.now().isoformat(), "items": items, "files": final}, f, indent=1)
+    print(c("32", "done"))
+
+
+def export_cmd(items):
+    """`cs _export`: this machine's sync files as a tar.gz on stdout (run over ssh by the other side)."""
+    snap = local_snapshot(items)
+    manifest = {"home": HOME, "version": VERSION,
+                "files": {k: {"hash": v["hash"], "mtime": v["mtime"]} for k, v in snap.items()}}
+    sys.stdout.buffer.write(pack(snap, {"manifest.json": json.dumps(manifest).encode()}))
+
+
+def import_cmd():
+    """`cs _import`: apply a plan tar.gz from stdin, report as JSON (run over ssh by the other side)."""
+    extra, files = unpack(sys.stdin.buffer.read())
+    plan = json.loads(extra.get("plan.json", b"{}"))
+    print(json.dumps(apply_changes(files, plan.get("deletes", []))))
+
+
 # ----------------------------------------------------------------- selection
 
 def select(sessions, days, min_active, sort):
@@ -1254,6 +1667,13 @@ def to_json(s):
 def main():
     global _ALL_SESSIONS, HOSTS
     argv = sys.argv[1:]
+    if argv[:1] == ["_export"]:  # called over ssh by another machine's cs
+        items = argv[argv.index("--items") + 1].split(",") if "--items" in argv else ["memory", "configs"]
+        export_cmd(items)
+        return
+    if argv[:1] == ["_import"]:
+        import_cmd()
+        return
     extra = []
     if "--" in argv:
         i = argv.index("--")
@@ -1266,6 +1686,10 @@ def main():
     ap.add_argument("--sort", choices=["recent", "active"], default="recent")
     ap.add_argument("--local", action="store_true")
     ap.add_argument("--host", action="append", default=[])
+    ap.add_argument("--memory", action="store_true")
+    ap.add_argument("--configs", action="store_true")
+    ap.add_argument("--prefer", choices=["newest", "local", "remote"], default="newest")
+    ap.add_argument("-y", "--yes", action="store_true")
     ap.add_argument("-p", "--print", action="store_true")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("-n", "--dry-run", action="store_true")
@@ -1286,6 +1710,22 @@ def main():
         return
     if rest[:1] == ["hosts"]:
         hosts_cmd(rest[1:], load_hosts())
+        return
+    if rest[:1] in (["sync"], ["migrate"]):
+        hosts = load_hosts(a.host)
+        items = ["memory"] if a.memory else ["configs"] if a.configs else ["memory", "configs"]
+        if rest[0] == "sync":
+            label = rest[1] if len(rest) > 1 else (next(iter(hosts)) if len(hosts) == 1 else None)
+            prefer, allow_delete, title = a.prefer, True, "sync with"
+        else:
+            if len(rest) != 3 or rest[1] not in ("to", "from"):
+                sys.exit("usage: cs migrate to LABEL | cs migrate from LABEL")
+            label = rest[2]
+            prefer = "local" if rest[1] == "to" else "remote"
+            allow_delete, title = False, f"migrate {rest[1]}"
+        if not label or label not in hosts:
+            sys.exit("which host? " + (", ".join(hosts) if hosts else "none configured (cs hosts add ...)"))
+        sync_cmd(label, hosts[label], items, prefer, a.dry_run, a.yes, allow_delete, title)
         return
     if a.all:
         a.min = 0

@@ -56,6 +56,39 @@ Keeping long-running sessions in tmux on an always-on machine is the setup this 
 for: the session, and any cron jobs inside it, survive closing your laptop, and you attach
 from anywhere with one keystroke in `cs`.
 
+## Memories and configs between machines
+
+Claude Code keeps what it learns about you and your projects on the machine it ran on:
+the `memory` folders under `~/.claude/projects`, plus your settings. `cs sync` keeps two
+machines in step, in both directions:
+
+```sh
+cs sync studio -n        # dry run: shows exactly what would change on each side
+cs sync studio           # shows the plan and asks before applying
+cs migrate to studio     # new machine: copy everything from here, nothing deleted
+cs migrate from studio   # the other way round
+```
+
+What travels: every project's memory folder, `settings.json`, `CLAUDE.md`,
+`keybindings.json`, your `commands`, `agents`, `hooks` and `skills` folders (minus the
+account-managed `skills/synced`), and the MCP server definitions from `~/.claude.json`.
+Transcripts, credentials, caches and session state stay where they are.
+
+How conflicts are settled:
+
+- A file that exists on one side only is copied to the other.
+- A file that differs on both sides goes to the newer copy, or to the side you name with
+  `--prefer local` / `--prefer remote`.
+- `settings.json` and the MCP server list are merged key by key, with lists unioned, so a
+  permission added on one machine and a model changed on the other both survive.
+- Each project's `MEMORY.md` index is merged so no memory loses its entry.
+- A file you deleted on one machine since the last sync is deleted on the other, as long
+  as the other copy was not changed in the meantime. `migrate` never deletes.
+- Anything replaced or removed is first copied to `~/.claude/backups/cs-sync-<time>/`.
+
+`--memory` or `--configs` limits a run to one group. A different username on the other
+machine is fine: project folders are matched by their path relative to each home.
+
 ## Install (macOS and Linux)
 
 ```sh
