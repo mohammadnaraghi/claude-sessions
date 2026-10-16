@@ -25,8 +25,11 @@ Other machines (over ssh, key auth)
   cs hosts setup studio          copy cs to that host so it can answer
   cs hosts rm studio             remove a host
   Sessions from every host then appear in the list with a host column.
-  Resuming one runs claude there over ssh -t, or attaches to its tmux
-  window when the session is already running inside tmux.
+  Resuming one starts claude there inside a tmux session (when tmux is
+  installed there), so closing your laptop only detaches it and picking
+  it again attaches. A session already running inside tmux is attached
+  to, never duplicated. --tmux does the same for local sessions;
+  --no-tmux runs plainly over ssh -t.
 
 Memories and configs between machines
   cs sync studio                 two-way sync of Claude's memory folders and
@@ -51,6 +54,7 @@ Options
   --sort recent|active   order by last activity (default) or by work time
   --local                this machine only, skip configured hosts
   --host LABEL=DEST      query this host too (or only, with --local)
+  --tmux | --no-tmux     run local sessions inside tmux too | never use tmux
   --json                 machine-readable output
   -n, --dry-run          print the resume command instead of running it
   --rescan               rebuild the cache from scratch
@@ -77,7 +81,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/claude-sessions/main/cs"
 CLAUDE_DIR = os.environ.get("CS_CLAUDE_DIR") or os.path.expanduser("~/.claude")  # override for tests
 PROJECTS = os.path.join(CLAUDE_DIR, "projects")
@@ -1384,22 +1388,44 @@ def live_block(s, indent="   "):
     return [indent + ln for ln in lines]
 
 
+TMUX_MODE = "auto"  # auto: remote sessions run inside tmux when it exists; always: local ones too; never
+
+
 def resume_command(s, extra):
     """(argv, description) that resumes or attaches to the session, locally or over ssh."""
     r = running_of(s)
     cwd = s.get("cwd") or "~"
     extra_q = " ".join(shlex.quote(e) for e in extra)
+    claude_cmd = f"cd {shlex.quote(cwd)} && claude --resume {s['id']} {extra_q}".rstrip()
+    tname = "cs-" + s["id"][:8]
     if is_remote(s):
         dest = HOSTS.get(s["host"], s["host"])
+        # the usual homes of claude and tmux, in case the remote shell's own PATH lacks them
+        path = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; '
         if r and r.get("tmux"):
-            inner = f"tmux attach -t {shlex.quote(r['tmux'])}"
+            inner, desc = path + f"exec tmux attach -t {shlex.quote(r['tmux'])}", f"tmux attach -t {r['tmux']}"
+        elif TMUX_MODE != "never":
+            # start claude inside a tmux session there: closing the laptop only detaches,
+            # and the next `cs` pick attaches to the same window
+            in_shell = f'"$SHELL" -lic {shlex.quote(path + claude_cmd)}'
+            inner = (path + f"if command -v tmux >/dev/null 2>&1; then exec tmux new-session -A -s {tname} "
+                     f"{shlex.quote(in_shell)}; else echo 'tmux is not installed there, so this session "
+                     f"ends if the connection drops'; {claude_cmd}; fi")
+            desc = f"tmux new-session -A -s {tname} '{claude_cmd}'"
         else:
-            inner = f"cd {shlex.quote(cwd)} && claude --resume {s['id']} {extra_q}".rstrip()
-        # an interactive login shell on the other side, so claude and tmux are on PATH
-        return ["ssh", "-t", dest, f'"$SHELL" -ic {shlex.quote(inner)}'], f"ssh -t {dest} '{inner}'"
+            inner, desc = path + claude_cmd, claude_cmd
+        # an interactive login shell on the other side, so the user's own PATH applies too
+        return ["ssh", "-t", dest, f'"$SHELL" -lic {shlex.quote(inner)}'], f"ssh -t {dest} '{desc}'"
     if r and r.get("tmux"):
         verb = "switch-client" if os.environ.get("TMUX") else "attach"
         return ["tmux", verb, "-t", r["tmux"]], f"tmux {verb} -t {r['tmux']}"
+    if TMUX_MODE == "always" and shutil.which("tmux"):
+        if os.environ.get("TMUX"):  # already inside tmux: open the session beside this one
+            argv = ["sh", "-c", f"tmux new-session -d -s {tname} {shlex.quote(claude_cmd)} 2>/dev/null; "
+                                f"exec tmux switch-client -t {tname}"]
+        else:
+            argv = ["tmux", "new-session", "-A", "-s", tname, claude_cmd]
+        return argv, f"tmux new-session -A -s {tname} '{claude_cmd}'"
     claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
     return [claude, "--resume", s["id"], *extra], f"cd {project(s)} && claude --resume {s['id']} {extra_q}".rstrip()
 
@@ -1504,6 +1530,9 @@ def resume(s, extra, dry_run):
         if r:
             print(c("33", "note: this session is already running elsewhere; this starts a second claude on it"))
         print(c("2", f"→ {desc}"))
+        if "tmux new-session" in desc:
+            print(c("2", "   runs inside tmux: closing this terminal or the laptop only detaches it; "
+                         "ctrl-b d detaches on purpose, and picking it in cs again attaches"))
     if dry_run:
         return
     if not is_remote(s):
@@ -1665,7 +1694,7 @@ def to_json(s):
 
 
 def main():
-    global _ALL_SESSIONS, HOSTS
+    global _ALL_SESSIONS, HOSTS, TMUX_MODE
     argv = sys.argv[1:]
     if argv[:1] == ["_export"]:  # called over ssh by another machine's cs
         items = argv[argv.index("--items") + 1].split(",") if "--items" in argv else ["memory", "configs"]
@@ -1686,6 +1715,8 @@ def main():
     ap.add_argument("--sort", choices=["recent", "active"], default="recent")
     ap.add_argument("--local", action="store_true")
     ap.add_argument("--host", action="append", default=[])
+    ap.add_argument("--tmux", action="store_true")
+    ap.add_argument("--no-tmux", action="store_true")
     ap.add_argument("--memory", action="store_true")
     ap.add_argument("--configs", action="store_true")
     ap.add_argument("--prefer", choices=["newest", "local", "remote"], default="newest")
@@ -1729,6 +1760,7 @@ def main():
         return
     if a.all:
         a.min = 0
+    TMUX_MODE = "never" if a.no_tmux else "always" if a.tmux else "auto"
 
     local = load_sessions(a.days, a.rescan)
     _ALL_SESSIONS = local

@@ -95,13 +95,15 @@ cs hosts setup studio                  # copies cs over, done
 </p>
 
 From then on the other machine's sessions sit in the same list with a host column, and
-`cs live` and `cs jobs` cover it as well. Picking one of its sessions resumes it there through
-ssh. If that session is already running inside a tmux window, `cs` attaches you to that
-window instead of starting a second copy. Add as many machines as you like, Mac or Linux, any
-names you want. It needs ssh with keys, the normal setup between your own machines.
+`cs live` and `cs jobs` cover it as well. Picking one of its sessions starts it there inside
+tmux, so closing your laptop only detaches you: the session and its scheduled jobs keep
+running, and picking it again drops you back into the same window. A session that is already
+running there is attached to, never started twice. Add as many machines as you like, Mac or
+Linux, any names you want. It needs ssh with keys, the normal setup between your own machines,
+and tmux on the other machine for the keep-running part (`brew install tmux` or
+`apt install tmux`; without it `cs` still resumes over plain ssh and says so).
 
-A tip: keep long-running sessions in tmux on an always-on machine. The session and its
-scheduled jobs survive closing your laptop, and `cs` gets you back to them from anywhere.
+Want the same safety on this machine? `cs --tmux 3` runs a local session inside tmux too.
 
 ## Keep two machines in sync
 
@@ -138,6 +140,7 @@ deletes nothing.
 | `cs sync NAME` | two-way sync of memories and settings, `-n` for a dry run |
 | `cs migrate to NAME` | set up a new machine from this one |
 | `cs -d 30` · `cs -a` | look back 30 days · show every session, however short |
+| `cs --tmux 3` | run a local session inside tmux so it survives closing the window |
 | `cs 3 -- --model opus` | pass extra flags to Claude Code |
 
 Inside the picker: a number resumes, `s 3` shows details, `/text` filters, `n` and `p` page,
