@@ -33,7 +33,28 @@ cron jobs (green while a job is still live). `cs live` shows what the running on
    cron   ↻ Every day at 7:13 AM · fires 2/7 (28%) · last Oct 16 07:13 · live · expires Oct 21 11:33
 ```
 
-Single Python file, no dependencies, nothing leaves your machine.
+Single Python file, no dependencies, nothing leaves your machines.
+
+## Other machines over ssh
+
+Sessions live on the computer that ran them, so `cs` can ask your other machines and show
+everything in one list. It needs key-based ssh that works without a prompt.
+
+```sh
+cs hosts add studio user@studio.local   # label, then the ssh destination
+cs hosts setup studio                   # copies cs to that machine
+cs hosts                                # check each host: reachable, cs version, tmux
+```
+
+From then on `cs`, `cs live` and `cs jobs` include that host, with a host column in the list.
+Picking a remote session runs `claude --resume` there through `ssh -t`. If the session is
+already running inside a tmux window, `cs` attaches to that window instead of starting a
+second copy, on either machine. `--local` skips the hosts, `--host label=dest` adds one for a
+single run, and `cs hosts rm studio` removes one.
+
+Keeping long-running sessions in tmux on an always-on machine is the setup this is built
+for: the session, and any cron jobs inside it, survive closing your laptop, and you attach
+from anywhere with one keystroke in `cs`.
 
 ## Install (macOS and Linux)
 
@@ -77,6 +98,8 @@ Options:
 -m, --min N            minimum active minutes to be listed (default 10)
 -a, --all              list every session touched in the window
 --sort recent|active   order by last activity (default) or by hours worked
+--local                this machine only, skip configured hosts
+--host LABEL=DEST      query this host too (or only, together with --local)
 --json                 machine-readable output
 -n, --dry-run          print the resume command instead of running it
 --rescan               rebuild the cache from scratch

@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """cs - Claude Code session picker.
 
-Lists your recent Claude Code sessions across every project folder, shows what
-each one was about, and resumes the one you pick: it cd's into the session's
-directory and runs `claude --resume <id>`. It also shows which sessions are
+Lists your recent Claude Code sessions across every project folder, and across
+other machines over ssh, shows what each one was about, and resumes the one you
+pick: it cd's into the session's directory and runs `claude --resume <id>`,
+over ssh when the session lives elsewhere. It also shows which sessions are
 running right now and what they are doing, and which ones set up cron jobs.
 
 Usage
   cs                     interactive picker (last 14 days, >= 10 min of work)
   cs 3                   resume the 3rd session in that list
   cs tiktok              filter by text; resumes directly on a single match
-                         (the words "running" and "cron" filter by status)
+                         ("running" and "cron" filter by status, @studio by host)
   cs show 3 | show <id>  details: work per day, prompts, live status, cron jobs
   cs live                running sessions: what they are doing and how far along
   cs jobs                every in-session cron job and its status
@@ -18,11 +19,22 @@ Usage
   cs -p                  print the list and exit (all rows when piped)
   cs update              replace this script with the latest release
 
+Other machines (over ssh, key auth)
+  cs hosts                       list configured hosts and check them
+  cs hosts add studio user@host  add a host (label, then ssh destination)
+  cs hosts setup studio          copy cs to that host so it can answer
+  cs hosts rm studio             remove a host
+  Sessions from every host then appear in the list with a host column.
+  Resuming one runs claude there over ssh -t, or attaches to its tmux
+  window when the session is already running inside tmux.
+
 Options
   -d, --days N           look back N days (default 14)
   -m, --min N            minimum active minutes to be listed (default 10)
   -a, --all              list every session touched in the window
   --sort recent|active   order by last activity (default) or by work time
+  --local                this machine only, skip configured hosts
+  --host LABEL=DEST      query this host too (or only, with --local)
   --json                 machine-readable output
   -n, --dry-run          print the resume command instead of running it
   --rescan               rebuild the cache from scratch
@@ -42,21 +54,28 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/claude-sessions/main/cs"
 CLAUDE_DIR = os.path.expanduser("~/.claude")
 PROJECTS = os.path.join(CLAUDE_DIR, "projects")
 CACHE_DIR = os.path.expanduser("~/.cache/claude-sessions")
 CACHE = os.path.join(CACHE_DIR, "cache.json")
 CACHE_VERSION = 4
+HOSTS_FILE = os.path.expanduser("~/.config/cs/hosts")
 HOME = os.path.expanduser("~")
+HOME_RE = re.compile(r"^/(?:Users|home)/[^/]+")
 GAP = 30 * 60  # silence longer than this is not counted as work
 CRON_LIFETIME = timedelta(days=7)  # recurring in-session jobs auto-expire after this
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=6"]
+# Non-interactive ssh shells have a bare PATH; find cs where the installer puts it.
+REMOTE_CS = "sh -c 'PATH=\"$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; exec cs \"$@\"' cs"
 SKIP_PREFIX = (
     "<task-notification>", "<system-reminder>", "[Request interrupted",
     "<artifact-content", "<local-command", "<command-name>", "<command-message>",
@@ -68,6 +87,7 @@ REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 WS_RE = re.compile(r"\s+")
 
 TTY = sys.stdout.isatty()
+HOSTS = {}
 
 
 def c(code, s):
@@ -280,6 +300,8 @@ def load_sessions(days, rescan=False):
     cache["__version__"] = CACHE_VERSION
     horizon = (datetime.now() - timedelta(days=days)).timestamp()
     out, dirty = [], False
+    if not os.path.isdir(PROJECTS):
+        return out
     for proj in os.scandir(PROJECTS):
         if not proj.is_dir():
             continue
@@ -299,7 +321,7 @@ def load_sessions(days, rescan=False):
                 dirty = True
             if not st["first"]:
                 continue
-            out.append(dict(id=ent.name[:-6], path=ent.path, project_dir=proj.name, **st))
+            out.append(dict(id=ent.name[:-6], path=ent.path, project_dir=proj.name, host=None, **st))
     if dirty:
         os.makedirs(CACHE_DIR, exist_ok=True)
         tmp = CACHE + ".tmp"
@@ -322,8 +344,46 @@ def pid_alive(pid):
         return False
 
 
+def tmux_panes():
+    """pane shell pid -> tmux target, so a session inside tmux can be attached to."""
+    if not shutil.which("tmux"):
+        return {}
+    try:
+        out = subprocess.run(["tmux", "list-panes", "-a", "-F",
+                              "#{pane_pid}\t#{session_name}:#{window_index}.#{pane_index}"],
+                             capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    panes = {}
+    for line in out.splitlines():
+        pid, _, target = line.partition("\t")
+        if pid.isdigit():
+            panes[int(pid)] = target
+    return panes
+
+
+def parent_pid(pid):
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=3).stdout.strip()
+        return int(out) if out else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def tmux_target(pid, panes):
+    """The tmux window a process lives in, found by walking up its parents."""
+    for _ in range(25):
+        if not pid or pid <= 1:
+            return None
+        if pid in panes:
+            return panes[pid]
+        pid = parent_pid(pid)
+    return None
+
+
 def running():
-    """sessionId -> info for Claude Code processes that are alive right now."""
+    """sessionId -> info for Claude Code processes that are alive on this machine right now."""
     global _RUNNING
     if _RUNNING is not None:
         return _RUNNING
@@ -348,6 +408,9 @@ def running():
             sid = w.get("sessionId")
             if sid and sid not in out and pid_alive(w.get("pid")):
                 out[sid] = {"status": "?", "name": None, "updated": None, "pid": w.get("pid"), "backend": "daemon"}
+    panes = tmux_panes() if out else {}
+    for info in out.values():
+        info["tmux"] = tmux_target(info["pid"], panes) if panes else None
     _RUNNING = out
     return out
 
@@ -363,6 +426,28 @@ def daemon_state(sid):
     except (ValueError, OSError):
         return None
     return o if o.get("sessionId", sid) == sid else None
+
+
+def is_remote(s):
+    return bool(s.get("host"))
+
+
+def running_of(s):
+    return s.get("_running") if is_remote(s) else running().get(s["id"])
+
+
+def daemon_of(s):
+    return s.get("_daemon") if is_remote(s) else daemon_state(s["id"])
+
+
+def doing(s):
+    """The tool call still waiting for a result, if any."""
+    if is_remote(s):
+        return s.get("_doing")
+    if not s.get("open_tools"):
+        return None
+    ts, nm, summary = list(s["open_tools"].values())[-1]
+    return f"{nm}: {summary}" if summary else nm
 
 
 # ----------------------------------------------------------------- cron jobs
@@ -427,8 +512,6 @@ def job_status(j, alive, session_last):
         if fires:
             return "done", "", None
         return ("waiting" if alive else "dead"), "", None
-    if created is None:
-        return "?", str(fires), None
     expiry = created + CRON_LIFETIME
     total = cron_fires(j["cron"], created, expiry) if j.get("cron") else None
     text = f"{fires}/{total} ({100 * fires // total}%)" if total else str(fires)
@@ -451,7 +534,7 @@ _ALL_SESSIONS = []
 
 
 def job_index():
-    """Jobs merged across sessions by id: a continued session splits one job over transcripts."""
+    """Local jobs merged across sessions by id: a continued session splits one job over transcripts."""
     global _JOB_INDEX
     if _JOB_INDEX is not None:
         return _JOB_INDEX
@@ -483,6 +566,8 @@ def merged_status(m):
 
 def session_jobs(s):
     """[(job, status, fires_text, expiry)] for a session's jobs, newest first."""
+    if is_remote(s):
+        return s["_jobs"]
     out = []
     for jid in s["jobs"]:
         m = job_index().get(jid)
@@ -529,6 +614,138 @@ def job_line(j, status, text, expiry):
     return " · ".join(parts)
 
 
+# ----------------------------------------------------------------- remote hosts
+
+def load_hosts(extra=None):
+    """label -> ssh destination, from ~/.config/cs/hosts plus any --host values."""
+    hosts = {}
+    if os.path.exists(HOSTS_FILE):
+        with open(HOSTS_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                hosts[parts[0]] = parts[1] if len(parts) > 1 else parts[0]
+    for h in extra or []:
+        label, _, dest = h.partition("=")
+        hosts[label] = dest or label
+    return hosts
+
+
+def save_hosts(hosts):
+    os.makedirs(os.path.dirname(HOSTS_FILE), exist_ok=True)
+    with open(HOSTS_FILE, "w") as f:
+        f.write("# label  ssh-destination   (cs lists and resumes sessions on these hosts over ssh)\n")
+        for label, dest in hosts.items():
+            f.write(f"{label} {dest}\n")
+
+
+def ssh(dest, command, timeout=40, tty=False):
+    cmd = ["ssh", *([] if tty else SSH_OPTS), *(["-t"] if tty else []), dest, command]
+    return subprocess.run(cmd, capture_output=not tty, text=True, timeout=timeout)
+
+
+def from_json(o, host):
+    """A session dict built from another machine's `cs --json` output."""
+    s = dict(o)
+    s["host"] = host
+    for k, v in (("project_dir", ""), ("open_tools", {}), ("todo", None), ("last_said", None),
+                 ("ctx_tokens", 0), ("last_prompt_ts", None), ("branch", None), ("model", None)):
+        s.setdefault(k, v)
+    s["_running"] = o.get("running")
+    s["_daemon"] = o.get("daemon")
+    s["_doing"] = o.get("doing")
+    jobs = o.get("jobs") or []
+    s["_jobs"] = [(j, j.get("status", "?"), j.get("fires_text", ""),
+                   parse_ts(j["expires"]) if j.get("expires") else None) for j in jobs]
+    s["jobs"] = {j["id"]: j for j in jobs}
+    return s
+
+
+def fetch_remote(hosts, days):
+    """[(label, sessions, error)] gathered over ssh, hosts queried in parallel."""
+    def one(item):
+        label, dest = item
+        try:
+            p = ssh(dest, f"{REMOTE_CS} --json --local -a -d {int(days)}")
+        except subprocess.TimeoutExpired:
+            return label, [], "timed out"
+        except OSError as e:
+            return label, [], str(e)
+        if p.returncode != 0:
+            err = (p.stderr.strip().splitlines() or ["ssh failed"])[-1]
+            if "not found" in err:
+                err = f"cs is not installed there, run: cs hosts setup {label}"
+            return label, [], err
+        try:
+            data = json.loads(p.stdout)
+        except ValueError:
+            return label, [], f"unexpected output, run: cs hosts setup {label}"
+        return label, [from_json(o, label) for o in data], None
+    with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as ex:
+        return list(ex.map(one, hosts.items()))
+
+
+def host_check(dest):
+    try:
+        p = ssh(dest, f"{REMOTE_CS} --version 2>/dev/null || echo 'cs missing'; "
+                      "if command -v tmux >/dev/null 2>&1 || [ -x /opt/homebrew/bin/tmux ]; "
+                      "then echo tmux; else echo 'no tmux'; fi", timeout=15)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, f"unreachable ({e.__class__.__name__})"
+    if p.returncode != 0:
+        return False, "unreachable: " + (p.stderr.strip().splitlines() or ["ssh failed"])[-1]
+    return True, " · ".join(p.stdout.split())
+
+
+def hosts_setup(label, dest):
+    """Copy this script to the host so it can answer `cs --json` and resume sessions."""
+    me = os.path.realpath(__file__)
+    print(f"copying cs {VERSION} to {label} ({dest}) ...")
+    try:
+        ssh(dest, "mkdir -p ~/.local/bin", timeout=20)
+        subprocess.run(["scp", "-q", *SSH_OPTS, me, f"{dest}:.local/bin/cs"], check=True, timeout=60)
+        p = ssh(dest, "chmod +x ~/.local/bin/cs && ~/.local/bin/cs --version && "
+                      "(command -v python3 >/dev/null 2>&1 || echo 'warning: python3 missing there') && "
+                      "if command -v tmux >/dev/null 2>&1 || [ -x /opt/homebrew/bin/tmux ]; "
+                      "then echo 'tmux: installed'; "
+                      "else echo 'tmux: not installed there (brew install tmux); sessions in tmux can be attached to'; fi",
+                timeout=20)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+        sys.exit(f"setup failed: {e}")
+    print((p.stdout or "") + (p.stderr or ""), end="")
+    if p.returncode != 0:
+        sys.exit("setup failed")
+    print(f"done. `cs` now includes {label}; `cs live` shows what runs there.")
+
+
+def hosts_cmd(args, hosts):
+    if not args:
+        if not hosts:
+            print("no hosts configured. add one with:  cs hosts add studio user@hostname")
+            return
+        width = max(len(k) for k in hosts)
+        for label, dest in hosts.items():
+            ok, msg = host_check(dest)
+            print(f"{c('32', '●') if ok else c('31', '●')} {c('1', label.ljust(width))}  {dest}  {c('2', msg)}")
+        return
+    sub = args[0]
+    if sub == "add" and len(args) in (2, 3):
+        label, dest = args[1], args[-1]
+        hosts[label] = dest
+        save_hosts(hosts)
+        print(f"added {label} -> {dest}\nnext: cs hosts setup {label}   (copies cs there)")
+    elif sub in ("rm", "remove") and len(args) == 2 and args[1] in hosts:
+        del hosts[args[1]]
+        save_hosts(hosts)
+        print(f"removed {args[1]}")
+    elif sub == "setup" and len(args) == 2 and args[1] in hosts:
+        hosts_setup(args[1], hosts[args[1]])
+    else:
+        sys.exit("usage: cs hosts | cs hosts add LABEL user@host | cs hosts setup LABEL | cs hosts rm LABEL")
+
+
 # ----------------------------------------------------------------- selection
 
 def select(sessions, days, min_active, sort):
@@ -555,8 +772,13 @@ def matches(s, query):
     words = query.lower().split()
     hay = None
     for w in words:
+        if w.startswith("@"):  # @studio = sessions on that host, @local = this machine
+            here = s.get("host") or "local"
+            if here != w[1:]:
+                return False
+            continue
         if w == "running":
-            if s["id"] not in running():
+            if not running_of(s):
                 return False
             continue
         if w == "cron":
@@ -564,7 +786,8 @@ def matches(s, query):
                 return False
             continue
         if hay is None:
-            hay = " ".join([s["id"], project(s), name(s), s["ai_title"] or "", last_prompt(s)]
+            hay = " ".join([s["id"], project(s), name(s), s.get("ai_title") or "", last_prompt(s),
+                            s.get("host") or ""]
                            + [p[1] for p in s["first_prompts"] + s["last_prompts"]]).lower()
         if w not in hay:
             return False
@@ -574,8 +797,8 @@ def matches(s, query):
 # ----------------------------------------------------------------- display
 
 def project(s):
-    p = s["cwd"] or s["project_dir"]
-    return p.replace(HOME, "~", 1) if p.startswith(HOME) else p
+    p = s.get("cwd") or s.get("project_dir") or "?"
+    return HOME_RE.sub("~", p, count=1)
 
 
 def short_project(s):
@@ -585,16 +808,16 @@ def short_project(s):
 
 def name(s):
     """Session name: your /rename title, else Claude's auto title, else first prompt."""
-    if s["custom_title"]:
+    if s.get("custom_title"):
         return s["custom_title"]
-    if s["ai_title"]:
+    if s.get("ai_title"):
         return s["ai_title"]
     return fit(s["first_prompts"][0][1], 60) if s["first_prompts"] else "(untitled)"
 
 
 def subtitle(s):
     """Auto title, shown next to a custom name when both exist and differ."""
-    if s["custom_title"] and s["ai_title"] and s["ai_title"] != s["custom_title"]:
+    if s.get("custom_title") and s.get("ai_title") and s["ai_title"] != s["custom_title"]:
         return s["ai_title"]
     return ""
 
@@ -643,14 +866,19 @@ def term():
 
 def flags(s):
     """Two marker cells: running, and cron jobs."""
-    r = running().get(s["id"])
-    a = (c("32", "●") if r["status"] == "busy" else c("33", "●")) if r else " "
+    r = running_of(s)
+    a = (c("32", "●") if r.get("status") == "busy" else c("33", "●")) if r else " "
     if s["jobs"]:
         statuses = {st for _, st, _, _ in session_jobs(s)}
         b = c("32", "↻") if statuses & {"live", "waiting"} else c("2", "↻")
     else:
         b = " "
     return a + b
+
+
+def where(s):
+    """'@host' suffix for remote sessions."""
+    return c("35", "@" + s["host"]) if is_remote(s) else ""
 
 
 def print_list(view, start=0, count=None):
@@ -662,18 +890,23 @@ def print_list(view, start=0, count=None):
     gutter = "   "
     show_proj = cols >= 100
     show_work = cols >= 80
+    hw = max([4] + [len(h) for h in HOSTS]) if HOSTS else 0
     nw = min(38, max(len(name(s)) for s in rows))
     pw = min(18, max(len(short_project(s)) for s in rows)) if show_proj else 0
     fixed = 3 + len(gutter) + 2 + len(gutter) + 7 + len(gutter) + nw + len(gutter)
+    if hw:
+        fixed += hw + len(gutter)
     if show_work:
         fixed += 5 + len(gutter)
     if show_proj:
         fixed += pw + len(gutter)
     lw = max(16, cols - fixed - 1)
 
-    def row(idx, flag, last, work, nm, proj, prompt, header=False):
-        cells = [(f"{idx:>3}", "1;36"), (flag, None),
-                 (f"{last:<7}", "32" if ("m ago" in last or "h ago" in last) else "")]
+    def row(idx, flag, host, last, work, nm, proj, prompt, header=False):
+        cells = [(f"{idx:>3}", "1;36"), (flag, None)]
+        if hw:
+            cells.append((f"{host:<{hw}}", "35"))
+        cells.append((f"{last:<7}", "32" if ("m ago" in last or "h ago" in last) else ""))
         if show_work:
             cells.append((f"{work:>5}", ""))
         cells.append((f"{nm:<{nw}}", "1"))
@@ -684,27 +917,19 @@ def print_list(view, start=0, count=None):
             return c("2", gutter.join(t for t, _ in cells))
         return gutter.join(t if code is None else (c(code, t) if code else t) for t, code in cells)
 
-    print(row("#", "  ", "last", "work", "session", "project", "last prompt", header=True))
+    print(row("#", "  ", "host", "last", "work", "session", "project", "last prompt", header=True))
     for i, s in enumerate(rows, start + 1):
-        print(row(i, flags(s), rel(s["last"]), hm(s["active_win"]), fit(name(s), nw),
+        print(row(i, flags(s), s.get("host") or "", rel(s["last"]), hm(s["active_win"]), fit(name(s), nw),
                   fit(short_project(s), pw), fit(last_prompt(s), lw)))
-
-
-def doing(s):
-    """The tool call still waiting for a result, if any."""
-    if not s["open_tools"]:
-        return None
-    ts, nm, summary = list(s["open_tools"].values())[-1]
-    return f"{nm}: {summary}" if summary else nm
 
 
 def live_block(s, indent="   "):
     """Lines describing what a running session is doing right now."""
-    r = running().get(s["id"])
+    r = running_of(s)
     lines = []
     if r:
-        status = r["status"]
-        ref = s["last_prompt_ts"] if status == "busy" else s["last"]
+        status = r.get("status") or "?"
+        ref = s.get("last_prompt_ts") if status == "busy" else s["last"]
         since = rel(ref or s["last"]).replace(" ago", "")
         if status == "busy":
             head = c("32", "busy") + f" for {since}"
@@ -712,12 +937,14 @@ def live_block(s, indent="   "):
             head = c("33", "idle") + f" since {since}"
         else:
             head = c("33", status) + f" · last activity {since} ago"
-        if s["ctx_tokens"]:
+        if s.get("ctx_tokens"):
             head += f" · context {ktok(s['ctx_tokens'])} tokens"
+        if r.get("tmux"):
+            head += f" · tmux {r['tmux']}"
         if r.get("backend") == "daemon":
             head += " · daemon"
         lines.append(head)
-    ds = daemon_state(s["id"])
+    ds = daemon_of(s)
     if ds and (r or ds.get("state") in ("working", "blocked")):
         lines.append(c("2", "state  ") + f"{ds.get('state')} · {fit(ds.get('detail') or '', 150)}")
         prs = [ch for ch in ds.get("children") or [] if ch.get("kind") == "pr"]
@@ -734,14 +961,34 @@ def live_block(s, indent="   "):
         d = doing(s)
         if d:
             lines.append(c("2", "doing  ") + fit(d, 150))
-        if s["last_said"]:
+        if s.get("last_said"):
             lines.append(c("2", "said   ") + fit(s["last_said"][1], 150))
-    if s["todo"]:
+    if s.get("todo"):
         td = s["todo"]
         pct = 100 * td["done"] // td["total"] if td["total"] else 0
         lines.append(c("2", "todo   ") + f"{td['done']}/{td['total']} done ({pct}%)"
                      + (f" · now: {fit(td['current'], 100)}" if td.get("current") else ""))
     return [indent + ln for ln in lines]
+
+
+def resume_command(s, extra):
+    """(argv, description) that resumes or attaches to the session, locally or over ssh."""
+    r = running_of(s)
+    cwd = s.get("cwd") or "~"
+    extra_q = " ".join(shlex.quote(e) for e in extra)
+    if is_remote(s):
+        dest = HOSTS.get(s["host"], s["host"])
+        if r and r.get("tmux"):
+            inner = f"tmux attach -t {shlex.quote(r['tmux'])}"
+        else:
+            inner = f"cd {shlex.quote(cwd)} && claude --resume {s['id']} {extra_q}".rstrip()
+        # an interactive login shell on the other side, so claude and tmux are on PATH
+        return ["ssh", "-t", dest, f'"$SHELL" -ic {shlex.quote(inner)}'], f"ssh -t {dest} '{inner}'"
+    if r and r.get("tmux"):
+        verb = "switch-client" if os.environ.get("TMUX") else "attach"
+        return ["tmux", verb, "-t", r["tmux"]], f"tmux {verb} -t {r['tmux']}"
+    claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+    return [claude, "--resume", s["id"], *extra], f"cd {project(s)} && claude --resume {s['id']} {extra_q}".rstrip()
 
 
 def show(s):
@@ -750,11 +997,13 @@ def show(s):
     days = " · ".join(f"{d[5:]} {hm(v / 60)}" for d, v in sorted(s["days"].items()) if v >= 60)
     print(c("1", f"Name     {name(s)}") + (c("2", f"   (auto title: {subtitle(s)})") if subtitle(s) else ""))
     print(f"Session  {s['id']}")
-    print(f"Project  {project(s)}" + (f"  (branch {s['branch']})" if s["branch"] else ""))
+    if is_remote(s):
+        print(f"Host     {s['host']}  ({HOSTS.get(s['host'], s['host'])})")
+    print(f"Project  {project(s)}" + (f"  (branch {s['branch']})" if s.get("branch") else ""))
     print(f"Started  {first:%a %b %d %H:%M}    Last active  {last:%a %b %d %H:%M}  ({rel(s['last'])})")
     print(f"Work     {hm(s['active'] / 60)} total · {days}")
     print(f"Volume   {s['user']} prompts · {s['assistant']} replies · {s['tools']} tool calls"
-          + (f" · {s['model']}" if s["model"] else ""))
+          + (f" · {s['model']}" if s.get("model") else ""))
     lb = live_block(s, indent="")
     if lb:
         print(c("1", "Now      ") + lb[0])
@@ -774,42 +1023,47 @@ def show(s):
         print(c("1", "Latest prompts"))
         for ts, p in s["last_prompts"]:
             print(f"  {parse_ts(ts).astimezone():%b %d %H:%M}  {fit(p, 200)}")
-    print(c("1", "Resume   ") + f"cd {project(s)} && claude --resume {s['id']}")
+    print(c("1", "Resume   ") + resume_command(s, [])[1])
 
 
 def live_view(sessions):
-    run = running()
-    rows = sorted((s for s in sessions if s["id"] in run), key=lambda s: s["last"], reverse=True)
+    rows = sorted((s for s in sessions if running_of(s)), key=lambda s: s["last"], reverse=True)
     if not rows:
-        print("no Claude Code sessions are running right now")
+        print("no Claude Code sessions are running right now" + (" on any host" if HOSTS else ""))
         return
     for s in rows:
-        r = run[s["id"]]
+        r = running_of(s)
         label = r.get("name") or name(s)
-        dot = c("32", "●") if r["status"] == "busy" else c("33", "●")
-        print(f"{dot} {c('1', label)}  {c('2', project(s))}")
+        dot = c("32", "●") if r.get("status") == "busy" else c("33", "●")
+        print(f"{dot} {c('1', label)} {where(s)}  {c('2', project(s))}")
         if label != name(s):
             print(f"   {c('2', 'name   ')}{name(s)}")
         for ln in live_block(s):
             print(ln)
-        jobs = [(j, st, text, exp) for j, st, text, exp in session_jobs(s) if st in ("live", "waiting")]
-        for j, st, text, exp in jobs:
-            print("   " + c("2", "cron   ") + job_line(j, st, text, exp))
+        for j, st, text, exp in session_jobs(s):
+            if st in ("live", "waiting"):
+                print("   " + c("2", "cron   ") + job_line(j, st, text, exp))
         print()
 
 
-def jobs_view():
+def jobs_view(sessions):
     rows = []
     for m in job_index().values():
         status, text, expiry = merged_status(m)
         key = m.get("created") or (m["fires"][0] if m["fires"] else "")
         rows.append((key, job_home(m), m, status, text, expiry))
+    for s in sessions:
+        if is_remote(s):
+            for j, status, text, expiry in s["_jobs"]:
+                key = j.get("created") or (j["fires"][0] if j["fires"] else "")
+                rows.append((key, s, j, status, text, expiry))
     if not rows:
         print("no in-session cron jobs found in this window (try -d 30)")
         return
     rows.sort(key=lambda r: r[0], reverse=True)
     cols, _ = term()
-    nw = min(30, max(len(name(s)) for _, s, *_ in rows))
+    label = lambda s: name(s) + (f" @{s['host']}" if is_remote(s) else "")  # noqa: E731
+    nw = min(34, max(len(label(s)) for _, s, *_ in rows))
     print(c("2", f"{'status':<9}   {'schedule':<24}   {'fires':<12}   {'last fire':<12}   {'session':<{nw}}   prompt"))
     for key, s, j, status, text, expiry in rows:
         sched = fit(j.get("human") or j.get("cron") or "?", 24)
@@ -820,23 +1074,28 @@ def jobs_view():
         st = c(col, f"{status:<9}") if col else f"{status:<9}"
         rest = cols - (9 + 3 + 24 + 3 + 12 + 3 + 12 + 3 + nw + 3) - 1
         print(f"{st}   {sched:<24}   {text or ('fired' if j['fires'] else '-'):<12}   {last:<12}   "
-              f"{c('1', fit(name(s), nw).ljust(nw))}   {fit(j.get('prompt') or '', max(10, rest))}")
+              f"{c('1', fit(label(s), nw).ljust(nw))}   {fit(j.get('prompt') or '', max(10, rest))}")
 
 
 def resume(s, extra, dry_run):
-    cwd = s["cwd"]
-    if not cwd or not os.path.isdir(cwd):
-        print(c("33", f"warning: {cwd} no longer exists, starting from {HOME}"))
-        cwd = HOME
-    if s["id"] in running():
-        print(c("33", "note: this session is already running in another terminal"))
-    claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
-    cmd = [claude, "--resume", s["id"], *extra]
-    print(c("2", f"→ cd {cwd.replace(HOME, '~', 1)} && claude --resume {s['id']} {' '.join(extra)}".rstrip()))
+    r = running_of(s)
+    if not is_remote(s):
+        cwd = s.get("cwd")
+        if not cwd or not os.path.isdir(cwd):
+            print(c("33", f"warning: {cwd} no longer exists, starting from {HOME}"))
+            s = dict(s, cwd=HOME)
+    argv, desc = resume_command(s, extra)
+    if r and r.get("tmux"):
+        print(c("2", f"→ attaching to the tmux window where this session runs: {desc}"))
+    else:
+        if r:
+            print(c("33", "note: this session is already running elsewhere; this starts a second claude on it"))
+        print(c("2", f"→ {desc}"))
     if dry_run:
         return
-    os.chdir(cwd)
-    os.execv(claude, cmd)
+    if not is_remote(s):
+        os.chdir(s.get("cwd") or HOME)
+    os.execvp(argv[0], argv)
 
 
 # ----------------------------------------------------------------- pickers
@@ -844,11 +1103,12 @@ def resume(s, extra, dry_run):
 def pick_fzf(view, self_path):
     lines = []
     for s in view:
-        r = running().get(s["id"])
+        r = running_of(s)
         mark = ("●" if r else " ") + ("↻" if s["jobs"] else " ")
-        lines.append("\t".join([s["id"], mark, f"{rel(s['last']):<7}", f"{hm(s['active_win']):>5}",
-                                fit(name(s), 38).ljust(38), fit(short_project(s), 18).ljust(18),
-                                last_prompt(s)]))
+        host = f"{(s.get('host') or ''):<8}" if HOSTS else ""
+        lines.append("\t".join([s["id"], mark + ("  " + host if host else ""), f"{rel(s['last']):<7}",
+                                f"{hm(s['active_win']):>5}", fit(name(s), 38).ljust(38),
+                                fit(short_project(s), 18).ljust(18), last_prompt(s)]))
     try:
         res = subprocess.run(
             ["fzf", "--delimiter=\t", "--with-nth=2..", "--no-sort", "--tabstop=1",
@@ -870,15 +1130,17 @@ def clear():
         sys.stdout.flush()
 
 
-def pick_builtin(view_all, query):
+def pick_builtin(view_all, query, notes):
     flt, page = query, 0
     while True:
         view = [s for s in view_all if matches(s, flt)] if flt else view_all
         _, lines = term()
-        per = max(5, lines - 6)
+        per = max(5, lines - 6 - len(notes))
         pages = max(1, math.ceil(len(view) / per))
         page = min(max(page, 0), pages - 1)
         clear()
+        for n in notes:
+            print(c("33", n))
         if flt:
             print(c("2", f"filter: {flt}   (/ clears)"))
         if view:
@@ -978,19 +1240,19 @@ def self_update():
 
 
 def to_json(s):
-    keys = ("id", "cwd", "branch", "custom_title", "ai_title", "first", "last", "active", "active_win",
-            "days", "user", "assistant", "tools", "model", "ctx_tokens", "todo", "last_said",
-            "first_prompts", "last_prompts")
-    r = running().get(s["id"])
-    return {"name": name(s), "last_prompt": last_prompt(s), "running": r, "doing": doing(s),
-            "daemon": daemon_state(s["id"]),
-            "jobs": [dict(j, status=st, fires_text=text, expires=exp.isoformat() if exp else None)
+    keys = ("id", "cwd", "project_dir", "host", "branch", "custom_title", "ai_title", "first", "last",
+            "active", "active_win", "days", "user", "assistant", "tools", "model", "ctx_tokens", "todo",
+            "last_said", "last_prompt_ts", "first_prompts", "last_prompts")
+    return {"name": name(s), "last_prompt": last_prompt(s), "running": running_of(s), "doing": doing(s),
+            "daemon": daemon_of(s),
+            "jobs": [dict({k: v for k, v in j.items() if k != "sessions"}, status=st, fires_text=text,
+                          expires=exp.isoformat() if exp else None)
                      for j, st, text, exp in session_jobs(s)],
             **{k: s.get(k) for k in keys}}
 
 
 def main():
-    global _ALL_SESSIONS
+    global _ALL_SESSIONS, HOSTS
     argv = sys.argv[1:]
     extra = []
     if "--" in argv:
@@ -1002,6 +1264,8 @@ def main():
     ap.add_argument("-m", "--min", type=float, default=10)
     ap.add_argument("-a", "--all", action="store_true")
     ap.add_argument("--sort", choices=["recent", "active"], default="recent")
+    ap.add_argument("--local", action="store_true")
+    ap.add_argument("--host", action="append", default=[])
     ap.add_argument("-p", "--print", action="store_true")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("-n", "--dry-run", action="store_true")
@@ -1016,21 +1280,41 @@ def main():
     if a.version:
         print(f"cs {VERSION}")
         return
-    if a.rest == ["update"]:
+    rest = a.rest
+    if rest == ["update"]:
         self_update()
+        return
+    if rest[:1] == ["hosts"]:
+        hosts_cmd(rest[1:], load_hosts())
         return
     if a.all:
         a.min = 0
 
-    sessions = load_sessions(a.days, a.rescan)
-    _ALL_SESSIONS = sessions
+    local = load_sessions(a.days, a.rescan)
+    _ALL_SESSIONS = local
+    sessions = list(local)
+    HOSTS = {}
+    if a.host or not a.local:
+        HOSTS = load_hosts(a.host)
+        if a.local:  # --local --host X: only the hosts named on the command line
+            named = {h.partition("=")[0] for h in a.host}
+            HOSTS = {k: v for k, v in HOSTS.items() if k in named}
+    notes = []
+    if HOSTS:
+        for label, remote, err in fetch_remote(HOSTS, a.days):
+            if err:
+                notes.append(f"{label}: {err}")
+            else:
+                sessions += remote
+    if notes and not a.json:
+        for n in notes:
+            print(c("33", n), file=sys.stderr)
     view = select(sessions, a.days, a.min, a.sort)
-    rest = a.rest
 
     if rest == ["live"]:
         pool = select(sessions, a.days, 0, "recent")
         if a.json:
-            print(json.dumps([to_json(s) for s in pool if s["id"] in running()], indent=1))
+            print(json.dumps([to_json(s) for s in pool if running_of(s)], indent=1))
         else:
             live_view(pool)
         return
@@ -1039,14 +1323,14 @@ def main():
         if a.json:
             print(json.dumps([to_json(s) for s in pool if s["jobs"]], indent=1))
         else:
-            jobs_view()
+            jobs_view(pool)
         return
     if rest and rest[0] in ("show", "path") and len(rest) == 2:
         s = find(view, sessions, rest[1])
         if rest[0] == "show":
             show(s)
         else:
-            print(s["cwd"] or HOME)
+            print(s.get("cwd") or HOME)
         return
 
     if a.json:
@@ -1077,7 +1361,7 @@ def main():
     if not a.no_fzf and shutil.which("fzf"):
         chosen = pick_fzf(hits, os.path.abspath(__file__))
     else:
-        chosen = pick_builtin(hits, query if len(hits) != len(view) else "")
+        chosen = pick_builtin(hits, query if len(hits) != len(view) else "", notes)
     if chosen:
         resume(chosen, extra, a.dry_run)
 
