@@ -3,13 +3,17 @@
 
 Lists your recent Claude Code sessions across every project folder, shows what
 each one was about, and resumes the one you pick: it cd's into the session's
-directory and runs `claude --resume <id>`.
+directory and runs `claude --resume <id>`. It also shows which sessions are
+running right now and what they are doing, and which ones set up cron jobs.
 
 Usage
   cs                     interactive picker (last 14 days, >= 10 min of work)
   cs 3                   resume the 3rd session in that list
   cs tiktok              filter by text; resumes directly on a single match
-  cs show 3 | show <id>  details for a session (index or id prefix)
+                         (the words "running" and "cron" filter by status)
+  cs show 3 | show <id>  details: work per day, prompts, live status, cron jobs
+  cs live                running sessions: what they are doing and how far along
+  cs jobs                every in-session cron job and its status
   cs path 3              print the session's directory  ->  cd "$(cs path 3)"
   cs -p                  print the list and exit (all rows when piped)
   cs update              replace this script with the latest release
@@ -26,10 +30,14 @@ Options
   -v, --version          print the version
   -- ARGS                pass ARGS to claude, e.g.  cs 2 -- --model opus
 
+Markers   ● session is running (green = busy, yellow = idle)
+          ↻ session set up cron jobs (green = a job is still live)
+
 Inside the picker:  3 = resume #3   s 3 = details   /text = filter
                     n / p = next / previous page     q = quit
 """
 import argparse
+import glob
 import json
 import math
 import os
@@ -37,16 +45,18 @@ import re
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dtime
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/claude-sessions/main/cs"
-PROJECTS = os.path.expanduser("~/.claude/projects")
+CLAUDE_DIR = os.path.expanduser("~/.claude")
+PROJECTS = os.path.join(CLAUDE_DIR, "projects")
 CACHE_DIR = os.path.expanduser("~/.cache/claude-sessions")
 CACHE = os.path.join(CACHE_DIR, "cache.json")
-CACHE_VERSION = 2
+CACHE_VERSION = 4
 HOME = os.path.expanduser("~")
 GAP = 30 * 60  # silence longer than this is not counted as work
+CRON_LIFETIME = timedelta(days=7)  # recurring in-session jobs auto-expire after this
 SKIP_PREFIX = (
     "<task-notification>", "<system-reminder>", "[Request interrupted",
     "<artifact-content", "<local-command", "<command-name>", "<command-message>",
@@ -96,10 +106,35 @@ def prompt_text(content):
     return " ".join(parts) if parts else None
 
 
+def tool_summary(name, inp):
+    if name == "Bash":
+        s = inp.get("description") or inp.get("command") or ""
+    elif name in ("Read", "Edit", "Write", "MultiEdit", "NotebookEdit"):
+        s = inp.get("file_path") or ""
+    elif name in ("Agent", "Task"):
+        s = inp.get("description") or ""
+    elif name in ("Grep", "Glob"):
+        s = inp.get("pattern") or ""
+    elif name == "Skill":
+        s = inp.get("skill") or ""
+    elif name in ("WebFetch", "WebSearch"):
+        s = inp.get("url") or inp.get("query") or ""
+    else:
+        s = json.dumps(inp)
+    return WS_RE.sub(" ", str(s))[:160]
+
+
+def job_stub(jid):
+    return dict(id=jid, cron=None, recurring=True, prompt="", created=None, human="",
+                deleted=None, fires=[], error=None)
+
+
 def new_state():
     return dict(offset=0, first=None, last=None, active=0.0, days={}, user=0,
                 assistant=0, tools=0, cwd=None, branch=None, model=None,
-                ai_title=None, custom_title=None, first_prompts=[], last_prompts=[])
+                ai_title=None, custom_title=None, first_prompts=[], last_prompts=[],
+                last_prompt_ts=None, last_said=None, open_tools={}, ctx_tokens=0,
+                todo=None, jobs={}, pending_cron={})
 
 
 def parse(path, st):
@@ -148,13 +183,40 @@ def parse(path, st):
         if o.get("gitBranch"):
             st["branch"] = o["gitBranch"]
         msg = o.get("message") or {}
+        content = msg.get("content")
         if t == "user":
+            if o.get("turnOrigin") == "scheduled" and o.get("scheduledTaskId"):
+                j = st["jobs"].setdefault(o["scheduledTaskId"], job_stub(o["scheduledTaskId"]))
+                j["fires"].append(ts.isoformat())
+                if not j["prompt"] and isinstance(content, str):
+                    j["prompt"] = WS_RE.sub(" ", content)[:200]
+                continue
+            if isinstance(content, list):
+                for x in content:
+                    if not (isinstance(x, dict) and x.get("type") == "tool_result"):
+                        continue
+                    tid = x.get("tool_use_id")
+                    st["open_tools"].pop(tid, None)
+                    if tid in st["pending_cron"]:
+                        inp = st["pending_cron"].pop(tid)
+                        body = x.get("content")
+                        s = body if isinstance(body, str) else json.dumps(body)
+                        m = re.search(r"(?:job|task) ([0-9a-f]{6,})", s)
+                        jid = m.group(1) if m else "?" + tid[-6:]
+                        j = st["jobs"].setdefault(jid, job_stub(jid))
+                        j.update(cron=inp["cron"], recurring=inp["recurring"], prompt=inp["prompt"],
+                                 created=inp["ts"])
+                        human = re.search(r"\((.*?)\)", s)
+                        j["human"] = human.group(1) if human else ""
+                        if not m:
+                            j["error"] = WS_RE.sub(" ", s)[:160]
             if o.get("isMeta"):
                 continue
-            txt = prompt_text(msg.get("content"))
+            txt = prompt_text(content)
             if not txt:
                 continue
             st["user"] += 1
+            st["last_prompt_ts"] = ts.isoformat()
             item = [ts.isoformat(), txt[:400]]
             recent = (st["last_prompts"] or st["first_prompts"])
             if recent and recent[-1][1] == txt[:400]:
@@ -167,9 +229,39 @@ def parse(path, st):
             st["assistant"] += 1
             if not st["model"] and msg.get("model"):
                 st["model"] = msg["model"]
-            content = msg.get("content")
-            if isinstance(content, list):
-                st["tools"] += sum(1 for x in content if isinstance(x, dict) and x.get("type") == "tool_use")
+            usage = msg.get("usage") or {}
+            ctx = ((usage.get("input_tokens") or 0) + (usage.get("cache_read_input_tokens") or 0)
+                   + (usage.get("cache_creation_input_tokens") or 0))
+            if ctx:
+                st["ctx_tokens"] = ctx
+            if not isinstance(content, list):
+                continue
+            for x in content:
+                if not isinstance(x, dict):
+                    continue
+                if x.get("type") == "text" and x.get("text", "").strip():
+                    st["last_said"] = [ts.isoformat(), WS_RE.sub(" ", x["text"]).strip()[:300]]
+                elif x.get("type") == "tool_use":
+                    st["tools"] += 1
+                    nm, inp = x.get("name"), x.get("input") or {}
+                    st["open_tools"][x["id"]] = [ts.isoformat(), nm, tool_summary(nm, inp)]
+                    while len(st["open_tools"]) > 8:
+                        del st["open_tools"][next(iter(st["open_tools"]))]
+                    if nm == "CronCreate":
+                        st["pending_cron"][x["id"]] = {
+                            "cron": inp.get("cron"), "recurring": inp.get("recurring", True),
+                            "prompt": WS_RE.sub(" ", inp.get("prompt") or "")[:200], "ts": ts.isoformat()}
+                    elif nm == "CronDelete":
+                        jid = inp.get("id") or inp.get("jobId")
+                        if jid:
+                            st["jobs"].setdefault(jid, job_stub(jid))["deleted"] = ts.isoformat()
+                    elif nm == "TodoWrite":
+                        todos = inp.get("todos") or []
+                        if todos:
+                            done = sum(1 for td in todos if td.get("status") == "completed")
+                            cur = next((td.get("activeForm") or td.get("content")
+                                        for td in todos if td.get("status") == "in_progress"), None)
+                            st["todo"] = {"done": done, "total": len(todos), "current": cur}
     st["first"] = first.isoformat() if first else None
     st["last"] = prev.isoformat() if prev else None
     return st
@@ -217,6 +309,226 @@ def load_sessions(days, rescan=False):
     return out
 
 
+# ----------------------------------------------------------------- live state
+
+_RUNNING = None
+
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def running():
+    """sessionId -> info for Claude Code processes that are alive right now."""
+    global _RUNNING
+    if _RUNNING is not None:
+        return _RUNNING
+    out = {}
+    for f in glob.glob(os.path.join(CLAUDE_DIR, "sessions", "*.json")):
+        try:
+            with open(f) as fh:
+                o = json.load(fh)
+        except (ValueError, OSError):
+            continue
+        if o.get("sessionId") and pid_alive(o.get("pid")):
+            out[o["sessionId"]] = {"status": o.get("status") or "?", "name": o.get("name"),
+                                   "updated": o.get("updatedAt"), "pid": o.get("pid"), "backend": "cli"}
+    roster = os.path.join(CLAUDE_DIR, "daemon", "roster.json")
+    if os.path.exists(roster):
+        try:
+            with open(roster) as fh:
+                workers = (json.load(fh).get("workers") or {}).values()
+        except (ValueError, OSError):
+            workers = []
+        for w in workers:
+            sid = w.get("sessionId")
+            if sid and sid not in out and pid_alive(w.get("pid")):
+                out[sid] = {"status": "?", "name": None, "updated": None, "pid": w.get("pid"), "backend": "daemon"}
+    _RUNNING = out
+    return out
+
+
+def daemon_state(sid):
+    """State written by daemon-managed sessions (Remote Control, background workers)."""
+    p = os.path.join(CLAUDE_DIR, "jobs", sid[:8], "state.json")
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p) as fh:
+            o = json.load(fh)
+    except (ValueError, OSError):
+        return None
+    return o if o.get("sessionId", sid) == sid else None
+
+
+# ----------------------------------------------------------------- cron jobs
+
+def cron_field(spec, lo, hi):
+    vals = set()
+    for part in spec.split(","):
+        step = 1
+        if "/" in part:
+            part, step = part.split("/", 1)
+            step = int(step)
+        if part == "*":
+            rng = range(lo, hi + 1)
+        elif "-" in part:
+            a, b = part.split("-", 1)
+            rng = range(int(a), int(b) + 1)
+        else:
+            v = int(part)
+            rng = range(v, hi + 1) if step > 1 else range(v, v + 1)
+        vals.update(range(rng.start, rng.stop, step))
+    return vals
+
+
+def cron_fires(expr, start, end):
+    """How many times a 5-field cron matches in (start, end]; None if unparsable."""
+    try:
+        m, h, dom, mon, dow = expr.split()
+        mins, hours = cron_field(m, 0, 59), cron_field(h, 0, 23)
+        doms, mons = cron_field(dom, 1, 31), cron_field(mon, 1, 12)
+        dows = {x % 7 for x in cron_field(dow, 0, 7)}
+    except (ValueError, AttributeError):
+        return None
+    n, day = 0, start.date()
+    while day <= end.date():
+        dmatch, wmatch = day.day in doms, (day.weekday() + 1) % 7 in dows
+        if dom != "*" and dow != "*":
+            ok = dmatch or wmatch
+        else:
+            ok = (dmatch if dom != "*" else True) and (wmatch if dow != "*" else True)
+        if ok and day.month in mons:
+            for hh in hours:
+                for mm in mins:
+                    t = datetime.combine(day, dtime(hh, mm), tzinfo=start.tzinfo)
+                    if start < t <= end:
+                        n += 1
+        day += timedelta(days=1)
+    return n
+
+
+def job_status(j, alive, session_last):
+    """-> (status, fires_text, expiry). Status: live, waiting, done, dead, expired, cancelled."""
+    now = datetime.now().astimezone()
+    fires = len(j["fires"])
+    if not j.get("created"):  # fired here, but created in a transcript we have not seen
+        return ("fired" if fires else "?"), (str(fires) if fires else ""), None
+    if j.get("error"):
+        return "failed", "", None
+    created = parse_ts(j["created"]).astimezone()
+    if not j.get("recurring", True):
+        if j.get("deleted"):
+            return "cancelled", "", None
+        if fires:
+            return "done", "", None
+        return ("waiting" if alive else "dead"), "", None
+    if created is None:
+        return "?", str(fires), None
+    expiry = created + CRON_LIFETIME
+    total = cron_fires(j["cron"], created, expiry) if j.get("cron") else None
+    text = f"{fires}/{total} ({100 * fires // total}%)" if total else str(fires)
+    if j.get("deleted"):
+        status = "cancelled"
+    elif alive and now < expiry:
+        status = "live"
+    elif not alive and (session_last is None or session_last < expiry):
+        status = "dead"
+    else:
+        status = "expired"
+    return status, text, expiry
+
+
+STATUS_COLOR = {"live": "32", "waiting": "33", "done": "", "fired": "", "dead": "2", "expired": "2",
+                "cancelled": "2", "failed": "31", "?": "2"}
+
+_JOB_INDEX = None
+_ALL_SESSIONS = []
+
+
+def job_index():
+    """Jobs merged across sessions by id: a continued session splits one job over transcripts."""
+    global _JOB_INDEX
+    if _JOB_INDEX is not None:
+        return _JOB_INDEX
+    idx = {}
+    for s in _ALL_SESSIONS:
+        for jid, j in s["jobs"].items():
+            m = idx.setdefault(jid, dict(job_stub(jid), sessions=[]))
+            m["sessions"].append(s)
+            for k in ("cron", "prompt", "created", "human", "deleted", "error"):
+                if j.get(k) and not m.get(k):
+                    m[k] = j[k]
+            if j.get("created"):
+                m["recurring"] = j.get("recurring", True)
+            m["fires"] = sorted(set(m["fires"]) | set(j["fires"]))
+    _JOB_INDEX = idx
+    return idx
+
+
+def job_home(m):
+    """The session a merged job belongs to now: the most recently active one that saw it."""
+    return max(m["sessions"], key=lambda s: s["last"])
+
+
+def merged_status(m):
+    home = job_home(m)
+    last = parse_ts(home["last"])
+    return job_status(m, home["id"] in running(), last.astimezone() if last else None)
+
+
+def session_jobs(s):
+    """[(job, status, fires_text, expiry)] for a session's jobs, newest first."""
+    out = []
+    for jid in s["jobs"]:
+        m = job_index().get(jid)
+        if m is None:
+            m = dict(s["jobs"][jid], sessions=[s])
+        status, text, expiry = merged_status(m)
+        out.append((m, status, text, expiry))
+    out.sort(key=lambda r: r[0].get("created") or (r[0]["fires"][0] if r[0]["fires"] else ""), reverse=True)
+    return out
+
+
+def once_text(j):
+    """A one-shot's cron 'M H D Mo *' rendered as a date."""
+    m = re.fullmatch(r"(\d+) (\d+) (\d+) (\d+) \*", (j.get("cron") or "").strip())
+    if m:
+        mi, hh, dd, mo = map(int, m.groups())
+        year = parse_ts(j["created"]).astimezone().year if j.get("created") else datetime.now().year
+        try:
+            return datetime(year, mo, dd, hh, mi).strftime("%b %d %H:%M")
+        except ValueError:
+            pass
+    return j.get("human") or j.get("cron") or "?"
+
+
+def job_line(j, status, text, expiry):
+    sched = j.get("human") or j.get("cron") or "?"
+    if not j.get("created"):
+        parts = ["? schedule unknown"]
+    elif j.get("recurring", True):
+        parts = ["↻ " + sched]
+    else:
+        parts = ["◦ once " + once_text(j)]
+    if j.get("recurring", True) and text:
+        parts.append("fires " + text)
+    if j["fires"]:
+        parts.append("last " + when(j["fires"][-1]))
+    parts.append(c("1;" + STATUS_COLOR[status] if STATUS_COLOR[status] else "1", status))
+    if status == "live" and expiry:
+        parts.append("expires " + when(expiry.isoformat()))
+    if status == "dead":
+        parts.append("session closed")
+    if j.get("error"):
+        parts.append(c("33", "create failed"))
+    return " · ".join(parts)
+
+
 # ----------------------------------------------------------------- selection
 
 def select(sessions, days, min_active, sort):
@@ -240,10 +552,23 @@ def select(sessions, days, min_active, sort):
 
 
 def matches(s, query):
-    q = query.lower()
-    hay = " ".join([s["id"], project(s), name(s), s["ai_title"] or "", last_prompt(s)]
-                   + [p[1] for p in s["first_prompts"] + s["last_prompts"]]).lower()
-    return all(w in hay for w in q.split())
+    words = query.lower().split()
+    hay = None
+    for w in words:
+        if w == "running":
+            if s["id"] not in running():
+                return False
+            continue
+        if w == "cron":
+            if not s["jobs"]:
+                return False
+            continue
+        if hay is None:
+            hay = " ".join([s["id"], project(s), name(s), s["ai_title"] or "", last_prompt(s)]
+                           + [p[1] for p in s["first_prompts"] + s["last_prompts"]]).lower()
+        if w not in hay:
+            return False
+    return True
 
 
 # ----------------------------------------------------------------- display
@@ -295,8 +620,16 @@ def rel(ts_iso):
     return ts.astimezone().strftime("%b %d")
 
 
+def when(ts_iso):
+    return parse_ts(ts_iso).astimezone().strftime("%b %d %H:%M")
+
+
 def hm(minutes):
     return f"{minutes / 60:.1f}h" if minutes >= 60 else f"{int(minutes)}m"
+
+
+def ktok(n):
+    return f"{n / 1000:.0f}k" if n >= 1000 else str(n)
 
 
 def fit(s, n):
@@ -306,6 +639,18 @@ def fit(s, n):
 def term():
     size = shutil.get_terminal_size((120, 40))
     return size.columns, size.lines
+
+
+def flags(s):
+    """Two marker cells: running, and cron jobs."""
+    r = running().get(s["id"])
+    a = (c("32", "●") if r["status"] == "busy" else c("33", "●")) if r else " "
+    if s["jobs"]:
+        statuses = {st for _, st, _, _ in session_jobs(s)}
+        b = c("32", "↻") if statuses & {"live", "waiting"} else c("2", "↻")
+    else:
+        b = " "
+    return a + b
 
 
 def print_list(view, start=0, count=None):
@@ -319,15 +664,15 @@ def print_list(view, start=0, count=None):
     show_work = cols >= 80
     nw = min(38, max(len(name(s)) for s in rows))
     pw = min(18, max(len(short_project(s)) for s in rows)) if show_proj else 0
-    fixed = 3 + len(gutter) + 7 + len(gutter) + nw + len(gutter)
+    fixed = 3 + len(gutter) + 2 + len(gutter) + 7 + len(gutter) + nw + len(gutter)
     if show_work:
         fixed += 5 + len(gutter)
     if show_proj:
         fixed += pw + len(gutter)
     lw = max(16, cols - fixed - 1)
 
-    def row(idx, last, work, nm, proj, prompt, header=False):
-        cells = [(f"{idx:>3}", "1;36"),
+    def row(idx, flag, last, work, nm, proj, prompt, header=False):
+        cells = [(f"{idx:>3}", "1;36"), (flag, None),
                  (f"{last:<7}", "32" if ("m ago" in last or "h ago" in last) else "")]
         if show_work:
             cells.append((f"{work:>5}", ""))
@@ -337,12 +682,66 @@ def print_list(view, start=0, count=None):
         cells.append((prompt, ""))
         if header:
             return c("2", gutter.join(t for t, _ in cells))
-        return gutter.join(c(code, t) if code else t for t, code in cells)
+        return gutter.join(t if code is None else (c(code, t) if code else t) for t, code in cells)
 
-    print(row("#", "last", "work", "session", "project", "last prompt", header=True))
+    print(row("#", "  ", "last", "work", "session", "project", "last prompt", header=True))
     for i, s in enumerate(rows, start + 1):
-        print(row(i, rel(s["last"]), hm(s["active_win"]), fit(name(s), nw),
+        print(row(i, flags(s), rel(s["last"]), hm(s["active_win"]), fit(name(s), nw),
                   fit(short_project(s), pw), fit(last_prompt(s), lw)))
+
+
+def doing(s):
+    """The tool call still waiting for a result, if any."""
+    if not s["open_tools"]:
+        return None
+    ts, nm, summary = list(s["open_tools"].values())[-1]
+    return f"{nm}: {summary}" if summary else nm
+
+
+def live_block(s, indent="   "):
+    """Lines describing what a running session is doing right now."""
+    r = running().get(s["id"])
+    lines = []
+    if r:
+        status = r["status"]
+        ref = s["last_prompt_ts"] if status == "busy" else s["last"]
+        since = rel(ref or s["last"]).replace(" ago", "")
+        if status == "busy":
+            head = c("32", "busy") + f" for {since}"
+        elif status == "idle":
+            head = c("33", "idle") + f" since {since}"
+        else:
+            head = c("33", status) + f" · last activity {since} ago"
+        if s["ctx_tokens"]:
+            head += f" · context {ktok(s['ctx_tokens'])} tokens"
+        if r.get("backend") == "daemon":
+            head += " · daemon"
+        lines.append(head)
+    ds = daemon_state(s["id"])
+    if ds and (r or ds.get("state") in ("working", "blocked")):
+        lines.append(c("2", "state  ") + f"{ds.get('state')} · {fit(ds.get('detail') or '', 150)}")
+        prs = [ch for ch in ds.get("children") or [] if ch.get("kind") == "pr"]
+        if prs:
+            by_repo = {}
+            for ch in prs:
+                repo = ch.get("href", "").rstrip("/").split("/")[-3] if "/pull/" in ch.get("href", "") else "pr"
+                by_repo.setdefault(repo, []).append("#" + str(ch.get("id")))
+            lines.append(c("2", "prs    ") + " · ".join(f"{k} {', '.join(v)}" for k, v in by_repo.items()))
+    if r:
+        ps = s["first_prompts"] + s["last_prompts"]
+        if ps:
+            lines.append(c("2", "asked  ") + fit(ps[-1][1], 150))
+        d = doing(s)
+        if d:
+            lines.append(c("2", "doing  ") + fit(d, 150))
+        if s["last_said"]:
+            lines.append(c("2", "said   ") + fit(s["last_said"][1], 150))
+    if s["todo"]:
+        td = s["todo"]
+        pct = 100 * td["done"] // td["total"] if td["total"] else 0
+        lines.append(c("2", "todo   ") + f"{td['done']}/{td['total']} done ({pct}%)"
+                     + (f" · now: {fit(td['current'], 100)}" if td.get("current") else ""))
+    return [indent + ln for ln in lines]
 
 
 def show(s):
@@ -356,6 +755,18 @@ def show(s):
     print(f"Work     {hm(s['active'] / 60)} total · {days}")
     print(f"Volume   {s['user']} prompts · {s['assistant']} replies · {s['tools']} tool calls"
           + (f" · {s['model']}" if s["model"] else ""))
+    lb = live_block(s, indent="")
+    if lb:
+        print(c("1", "Now      ") + lb[0])
+        for ln in lb[1:]:
+            print("         " + ln)
+    jobs = session_jobs(s)
+    if jobs:
+        print(c("1", "Cron jobs"))
+        for j, status, text, expiry in jobs:
+            print("  " + job_line(j, status, text, expiry))
+            if j.get("prompt"):
+                print("     " + c("2", fit(j["prompt"], 140)))
     print(c("1", "First prompts"))
     for ts, p in s["first_prompts"]:
         print(f"  {parse_ts(ts).astimezone():%b %d %H:%M}  {fit(p, 200)}")
@@ -366,11 +777,59 @@ def show(s):
     print(c("1", "Resume   ") + f"cd {project(s)} && claude --resume {s['id']}")
 
 
+def live_view(sessions):
+    run = running()
+    rows = sorted((s for s in sessions if s["id"] in run), key=lambda s: s["last"], reverse=True)
+    if not rows:
+        print("no Claude Code sessions are running right now")
+        return
+    for s in rows:
+        r = run[s["id"]]
+        label = r.get("name") or name(s)
+        dot = c("32", "●") if r["status"] == "busy" else c("33", "●")
+        print(f"{dot} {c('1', label)}  {c('2', project(s))}")
+        if label != name(s):
+            print(f"   {c('2', 'name   ')}{name(s)}")
+        for ln in live_block(s):
+            print(ln)
+        jobs = [(j, st, text, exp) for j, st, text, exp in session_jobs(s) if st in ("live", "waiting")]
+        for j, st, text, exp in jobs:
+            print("   " + c("2", "cron   ") + job_line(j, st, text, exp))
+        print()
+
+
+def jobs_view():
+    rows = []
+    for m in job_index().values():
+        status, text, expiry = merged_status(m)
+        key = m.get("created") or (m["fires"][0] if m["fires"] else "")
+        rows.append((key, job_home(m), m, status, text, expiry))
+    if not rows:
+        print("no in-session cron jobs found in this window (try -d 30)")
+        return
+    rows.sort(key=lambda r: r[0], reverse=True)
+    cols, _ = term()
+    nw = min(30, max(len(name(s)) for _, s, *_ in rows))
+    print(c("2", f"{'status':<9}   {'schedule':<24}   {'fires':<12}   {'last fire':<12}   {'session':<{nw}}   prompt"))
+    for key, s, j, status, text, expiry in rows:
+        sched = fit(j.get("human") or j.get("cron") or "?", 24)
+        if not j.get("recurring", True):
+            sched = fit("once " + once_text(j), 24)
+        last = when(j["fires"][-1]) if j["fires"] else "-"
+        col = STATUS_COLOR[status]
+        st = c(col, f"{status:<9}") if col else f"{status:<9}"
+        rest = cols - (9 + 3 + 24 + 3 + 12 + 3 + 12 + 3 + nw + 3) - 1
+        print(f"{st}   {sched:<24}   {text or ('fired' if j['fires'] else '-'):<12}   {last:<12}   "
+              f"{c('1', fit(name(s), nw).ljust(nw))}   {fit(j.get('prompt') or '', max(10, rest))}")
+
+
 def resume(s, extra, dry_run):
     cwd = s["cwd"]
     if not cwd or not os.path.isdir(cwd):
         print(c("33", f"warning: {cwd} no longer exists, starting from {HOME}"))
         cwd = HOME
+    if s["id"] in running():
+        print(c("33", "note: this session is already running in another terminal"))
     claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
     cmd = [claude, "--resume", s["id"], *extra]
     print(c("2", f"→ cd {cwd.replace(HOME, '~', 1)} && claude --resume {s['id']} {' '.join(extra)}".rstrip()))
@@ -385,13 +844,15 @@ def resume(s, extra, dry_run):
 def pick_fzf(view, self_path):
     lines = []
     for s in view:
-        lines.append("\t".join([s["id"], f"{rel(s['last']):<7}", f"{hm(s['active_win']):>5}",
+        r = running().get(s["id"])
+        mark = ("●" if r else " ") + ("↻" if s["jobs"] else " ")
+        lines.append("\t".join([s["id"], mark, f"{rel(s['last']):<7}", f"{hm(s['active_win']):>5}",
                                 fit(name(s), 38).ljust(38), fit(short_project(s), 18).ljust(18),
                                 last_prompt(s)]))
     try:
         res = subprocess.run(
             ["fzf", "--delimiter=\t", "--with-nth=2..", "--no-sort", "--tabstop=1",
-             "--header=enter = resume · ctrl-c = quit",
+             "--header=enter = resume · ctrl-c = quit · ● running · ↻ cron jobs",
              "--preview", f"{sys.executable} {self_path} show {{1}}",
              "--preview-window=down,55%,wrap"],
             input="\n".join(lines), capture_output=True, text=True)
@@ -428,7 +889,7 @@ def pick_builtin(view_all, query):
         status = f"{len(view)} sessions"
         if pages > 1:
             status += f" · page {page + 1}/{pages} · n / p to page"
-        print(c("2", f"{status} · number = resume · s # = details · /text = filter · q = quit"))
+        print(c("2", f"{status} · number = resume · s # = details · /text = filter · q = quit · ● running · ↻ cron"))
         try:
             ans = input(c("1", "> ")).strip()
         except (EOFError, KeyboardInterrupt):
@@ -516,7 +977,20 @@ def self_update():
     print(f"cs updated {VERSION} -> {new}")
 
 
+def to_json(s):
+    keys = ("id", "cwd", "branch", "custom_title", "ai_title", "first", "last", "active", "active_win",
+            "days", "user", "assistant", "tools", "model", "ctx_tokens", "todo", "last_said",
+            "first_prompts", "last_prompts")
+    r = running().get(s["id"])
+    return {"name": name(s), "last_prompt": last_prompt(s), "running": r, "doing": doing(s),
+            "daemon": daemon_state(s["id"]),
+            "jobs": [dict(j, status=st, fires_text=text, expires=exp.isoformat() if exp else None)
+                     for j, st, text, exp in session_jobs(s)],
+            **{k: s.get(k) for k in keys}}
+
+
 def main():
+    global _ALL_SESSIONS
     argv = sys.argv[1:]
     extra = []
     if "--" in argv:
@@ -549,9 +1023,24 @@ def main():
         a.min = 0
 
     sessions = load_sessions(a.days, a.rescan)
+    _ALL_SESSIONS = sessions
     view = select(sessions, a.days, a.min, a.sort)
-
     rest = a.rest
+
+    if rest == ["live"]:
+        pool = select(sessions, a.days, 0, "recent")
+        if a.json:
+            print(json.dumps([to_json(s) for s in pool if s["id"] in running()], indent=1))
+        else:
+            live_view(pool)
+        return
+    if rest == ["jobs"]:
+        pool = select(sessions, a.days, 0, "recent")
+        if a.json:
+            print(json.dumps([to_json(s) for s in pool if s["jobs"]], indent=1))
+        else:
+            jobs_view()
+        return
     if rest and rest[0] in ("show", "path") and len(rest) == 2:
         s = find(view, sessions, rest[1])
         if rest[0] == "show":
@@ -561,10 +1050,7 @@ def main():
         return
 
     if a.json:
-        keys = ("id", "cwd", "branch", "custom_title", "ai_title", "first", "last", "active", "active_win",
-                "days", "user", "assistant", "tools", "model", "first_prompts", "last_prompts")
-        print(json.dumps([{"name": name(s), "last_prompt": last_prompt(s), **{k: s.get(k) for k in keys}}
-                          for s in view], indent=1))
+        print(json.dumps([to_json(s) for s in view], indent=1))
         return
 
     query = " ".join(rest)

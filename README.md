@@ -8,15 +8,29 @@ was about, and resumes the one you pick: it `cd`s into the session's directory a
 `claude --resume <id>` for you.
 
 ```
-  #   last       work   session                              project        last prompt
-  1   12m ago    3.4h   Checkout flow A/B test               web            compare conversion between variants
-  2   2h ago    29.0h   TikTok attribution                   api            add lookalike audiences to the campaign
-  3   1d ago     1.1h   Mandatory Expo updates               mobile         generate the update log for this release
-  4   2d ago    14.0h   Unresolved support issues            slackbot       set up the daily parse as a cron job
-  5   3d ago     45m    LogRocket removal                    mobile         remove it everywhere and open a PR
+  #        last       work   session                              project        last prompt
+  1   ●    12m ago    3.4h   Checkout flow A/B test               web            compare conversion between variants
+  2    ↻   2h ago    29.0h   TikTok attribution                   api            add lookalike audiences to the campaign
+  3        1d ago     1.1h   Mandatory Expo updates               mobile         generate the update log for this release
+  4   ●↻   2d ago    14.0h   Unresolved support issues            slackbot       set up the daily parse as a cron job
+  5        3d ago     45m    LogRocket removal                    mobile         remove it everywhere and open a PR
 
-32 sessions · page 1/4 · n / p to page · number = resume · s # = details · /text = filter · q = quit
+32 sessions · page 1/4 · n / p to page · number = resume · s # = details · /text = filter · q = quit · ● running · ↻ cron
 >
+```
+
+`●` marks a session that is running right now (green busy, yellow idle) and `↻` one that set up
+cron jobs (green while a job is still live). `cs live` shows what the running ones are doing:
+
+```
+● slackbot-59  ~/slackbot
+   name   Unresolved support issues
+   busy for 2m · context 466k tokens
+   asked  full audit of this PR, check the reviewer bot comments
+   doing  Bash: run the search fuzz tests
+   said   Lint is clean now. Redoing the three commits, pushing, and opening the PR.
+   todo   3/8 done (37%) · now: write the fuzz test
+   cron   ↻ Every day at 7:13 AM · fires 2/7 (28%) · last Oct 16 07:13 · live · expires Oct 21 11:33
 ```
 
 Single Python file, no dependencies, nothing leaves your machine.
@@ -44,7 +58,10 @@ search with a live preview of each session.
 cs                     interactive picker (last 14 days, sessions with 10+ min of work)
 cs 3                   resume the 3rd session in that list
 cs tiktok              filter by text; resumes directly on a single match
-cs show 3              details: project, per-day work, first and latest prompts
+                       (the words "running" and "cron" filter by status)
+cs show 3              details: per-day work, prompts, live status, cron jobs
+cs live                running sessions: what they are doing and how far along
+cs jobs                every in-session cron job with fires, last fire and status
 cs path 3              print the session's directory, so  cd "$(cs path 3)"  works
 cs -p                  print the list and exit (every row when piped)
 cs update              replace the script with the latest release
@@ -75,6 +92,15 @@ Options:
 - **Session name** is the title you set with `/rename`, otherwise the title Claude Code
   generates automatically, otherwise the first prompt.
 - **Last prompt** is the last thing you asked, skipping one or two word replies like "yes".
+- **Running** sessions come from the per-process files Claude Code keeps in `~/.claude/sessions`
+  (checked against live pids). For those, `cs live` reads the end of the transcript: the last
+  prompt, the tool call still waiting for a result, the last status line Claude wrote, the
+  context size, and the todo list if the session keeps one. Sessions started through Remote
+  Control or as background workers also expose a state line and the PRs they opened.
+- **Cron jobs** are the `CronCreate` calls a session made. Each fire is a prompt tagged as
+  scheduled, so `cs` counts fires against the fires possible in the job's 7-day lifetime.
+  A job is `live` only while its session is still running; once the terminal closes it shows
+  as `dead`, and `expired` or `cancelled` when that happened first.
 - Results are cached in `~/.cache/claude-sessions/cache.json` and updated incrementally, so
   the first run takes a few seconds and later runs are instant.
 
