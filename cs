@@ -101,7 +101,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/claude-sessions/main/cs"
 CLAUDE_DIR = os.environ.get("CS_CLAUDE_DIR") or os.path.expanduser("~/.claude")  # override for tests
 PROJECTS = os.path.join(CLAUDE_DIR, "projects")
@@ -115,11 +115,14 @@ GAP = 30 * 60  # silence longer than this is not counted as work
 CRON_LIFETIME = timedelta(days=7)  # recurring in-session jobs auto-expire after this
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 CODEX_CACHE = os.path.join(CACHE_DIR, "codex.json")
-CODEX_CACHE_VERSION = 2
+CODEX_CACHE_VERSION = 3
 # files Codex rewrites whenever a thread changes; while none is newer, the cached list is current
 CODEX_STAMP_FILES = ("session_index.jsonl", "state_*.sqlite*", "thread_history_*.sqlite*")
-HANDOFF_DIR = os.path.join(CACHE_DIR, "handoffs")  # Codex transcripts handed to Claude
+HANDOFF_DIR = os.path.join(CACHE_DIR, "handoffs")  # transcripts handed from one tool to the other
 HANDOFF_MAX = 60_000
+# Codex models read about 272k tokens. A Claude conversation bigger than this is not imported
+# whole (Codex could not even compact it); Codex gets Claude's summary plus the recent part.
+IMPORT_MAX_TOKENS = 150_000
 REMOTE_WAIT = 1.2  # seconds to wait for other machines before showing their last answer
 # Reuse one ssh connection per host for a few minutes, so repeated runs skip the handshake.
 CONTROL_OPTS = (["-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/cs-%C", "-o", "ControlPersist=10m"]
@@ -533,6 +536,7 @@ def codex_state(srv, t):
         last = end if last is None else max(last, end)
         for item in turn.get("items") or []:
             if item.get("type") == "userMessage":
+                add_links(st, HANDOFF_RE, item_text(item))
                 txt = clean_part(item_text(item))
                 if not txt:
                     continue
@@ -553,6 +557,10 @@ def codex_state(srv, t):
                     add_links(st, READS_CLAUDE_RE, item.get("command"))
     st["first"] = iso(first or t.get("createdAt") or 0)
     st["last"] = iso(max(x for x in (last, t.get("updatedAt"), first, 0) if x is not None))
+    err = ((turns[-1].get("error") or {}).get("message") or "") if turns else ""
+    if turns and turns[-1].get("status") == "failed" and ("context_length_exceeded" in err
+                                                         or "context window" in err):
+        st["broken"] = "too big for Codex's context window"  # every new turn fails the same way
     return st
 
 
@@ -692,10 +700,88 @@ def codex_handoff(s):
     return path
 
 
-def handoff_prompt(path):
+def handoff_prompt(path, source="codex"):
+    if source == "claude":
+        return (f"I'm switching to you from a Claude Code session in this folder. It is too long to "
+                f"import whole, so here is Claude's summary of the earlier work plus the most recent "
+                f"part: {path}. Read it, then tell me in a few lines where that session left off and "
+                f"what is still open. Don't start new work until I say so.")
     return (f"I'm switching to you from a Codex (GPT) session in this folder. Its transcript is at "
             f"{path}. Read it, then tell me in a few lines where that session left off and what is "
             f"still open. Don't start new work until I say so.")
+
+
+def read_claude(path):
+    """One pass over a Claude transcript -> (estimated tokens of the conversation, Claude's latest
+    compaction summary, the conversation as short markdown entries)."""
+    chars, summary, entries = 0, None, []
+    with open(path, errors="ignore") as f:
+        for line in f:
+            if '"type":"user"' not in line and '"type":"assistant"' not in line:
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if o.get("type") not in ("user", "assistant") or o.get("isSidechain"):
+                continue
+            content = (o.get("message") or {}).get("content")
+            blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content or []
+            for b in blocks:
+                if not isinstance(b, dict):
+                    continue
+                kind = b.get("type")
+                if kind == "text":
+                    chars += len(b.get("text") or "")
+                    if o.get("type") == "assistant" and (b.get("text") or "").strip():
+                        entries.append("**Claude:** " + b["text"].strip())
+                elif kind == "tool_use":
+                    chars += len(json.dumps(b.get("input")))
+                    entries.append("- used " + f"{b.get('name')}: {tool_summary(b.get('name'), b.get('input') or {})}")
+                elif kind == "tool_result":
+                    body = b.get("content")
+                    chars += len(body if isinstance(body, str) else json.dumps(body))
+            if o.get("type") == "user":
+                if o.get("isCompactSummary"):
+                    summary = claude_text_of(content)
+                    continue
+                if o.get("isMeta"):
+                    continue
+                txt = prompt_text(content)
+                if txt:
+                    entries.append("**You:** " + txt)
+    return chars // 4, summary, entries
+
+
+def claude_text_of(content):
+    if isinstance(content, str):
+        return content
+    return "\n".join(b.get("text", "") for b in content or [] if isinstance(b, dict) and b.get("type") == "text")
+
+
+def claude_handoff(s, summary, entries):
+    """Write a Claude conversation for Codex to read: Claude's summary of the earlier work plus
+    the most recent part. -> path."""
+    kept, size = [], 0
+    for entry in reversed(entries):
+        if kept and size + len(entry) > HANDOFF_MAX:
+            break
+        kept.append(entry)
+        size += len(entry)
+    kept.reverse()
+    head = [f"# Claude Code session: {name(s)}", "", f"- Session: `{s['id']}`",
+            f"- Folder: {s.get('cwd') or '?'}", f"- Last active: {when(s['last'])}",
+            f"- The whole transcript: {s['path']}"]
+    parts = ["\n".join(head)]
+    if summary:
+        parts.append("## Claude's summary of the earlier work\n\n" + summary.strip())
+    parts.append("## The most recent part" + (" (earlier turns left out)" if len(kept) < len(entries) else "")
+                 + "\n\n" + "\n\n".join(kept))
+    os.makedirs(HANDOFF_DIR, exist_ok=True)
+    path = os.path.join(HANDOFF_DIR, s["id"] + ".md")
+    with open(path, "w") as f:
+        f.write("\n\n---\n\n".join(parts) + "\n")
+    return path
 
 
 def codex_args():
@@ -738,7 +824,8 @@ def link_sessions(sessions):
         if len(members) < 2:
             continue
         members.sort(key=lambda m: m["last"])
-        chain = [{"id": m["id"], "app": app_of(m), "last": m["last"], "name": name(m)} for m in members]
+        chain = [{"id": m["id"], "app": app_of(m), "last": m["last"], "name": name(m),
+                  "broken": m.get("broken")} for m in members]
         for m in members:
             m["group"], m["chain"] = members[0]["id"], chain
 
@@ -753,7 +840,8 @@ def merge_rows(sessions):
         else:
             rows.append(s)
     for members in groups.values():
-        latest = max(members, key=lambda m: m["last"])
+        usable = [m for m in members if not m.get("broken")] or members  # skip a thread Codex can't run
+        latest = max(usable, key=lambda m: m["last"])
         first = min(members, key=lambda m: m.get("first") or m["last"])
         days = {}
         for m in members:
@@ -1093,7 +1181,7 @@ def from_json(o, host):
     s["host"] = host
     for k, v in (("project_dir", ""), ("open_tools", {}), ("todo", None), ("last_said", None),
                  ("ctx_tokens", 0), ("last_prompt_ts", None), ("branch", None), ("model", None),
-                 ("app", "claude"), ("group", None), ("chain", None)):
+                 ("app", "claude"), ("group", None), ("chain", None), ("broken", None)):
         s.setdefault(k, v)
     s["_running"] = o.get("running")
     s["_daemon"] = o.get("daemon")
@@ -1875,16 +1963,20 @@ DAYS = 14
 
 
 def local_argv(s, target, extra, prepared=None):
-    """argv that continues s in `target` here. prepared: the imported Codex thread id
-    (Claude -> Codex) or the transcript path (Codex -> Claude)."""
+    """argv that continues s in `target` here. prepared, when switching tools: ("thread", id) for a
+    Claude conversation imported into Codex, or ("transcript", path) for one handed over as text."""
+    kind, value = prepared or ("transcript", "<transcript>")
     if target == "claude":
         claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
         if app_of(s) == "claude":
             return [claude, "--resume", s["id"], *extra]
-        return [claude, "--add-dir", HANDOFF_DIR, handoff_prompt(prepared or "<transcript>"), *extra]
+        return [claude, "--add-dir", HANDOFF_DIR, handoff_prompt(value, "codex"), *extra]
     codex = shutil.which("codex") or "codex"
-    thread = s["id"] if app_of(s) == "codex" else (prepared or "<new thread>")
-    return [codex, *codex_args(), "resume", thread, *extra]
+    if app_of(s) == "codex":
+        return [codex, *codex_args(), "resume", s["id"], *extra]
+    if kind == "thread":
+        return [codex, *codex_args(), "resume", value, *extra]
+    return [codex, *codex_args(), *extra, handoff_prompt(value, "claude")]
 
 
 def resume_command(s, extra, target=None, prepared=None):
@@ -1974,10 +2066,14 @@ def show(s):
     if chain:
         print(c("1", "Chain") + c("2", "    this conversation moved between tools; its number opens the latest"))
         for i, m in enumerate(chain):
-            mark = c("32", "  ← latest") if m["id"] == chain[-1]["id"] else ""
+            mark = (c("33", f"  ({m['broken']})") if m.get("broken")
+                    else c("32", "  ← opens") if m["id"] == s["id"] else "")
             print(f"  {'→' if i else ' '} {c(APP_COLOR.get(m['app'], ''), m['app'].ljust(6))} "
                   f"{when(m['last'])}  {fit(m['name'], 50).ljust(50)}  {c('2', m['id'][:8])}{mark}")
         print(c("2", "  (cs <id> opens exactly that session)"))
+    if s.get("broken"):
+        print(c("33", f"Note     this Codex thread is {s['broken']}: every new message fails. Continue the "
+                      f"conversation from its Claude session with --codex for a fresh thread on a summary."))
     print(c("1", "Resume   ") + resume_command(s, [])[1])
     other = "codex" if app_of(s) == "claude" else "claude"
     print(c("1", APP_LABEL[other].split()[0].ljust(9)) + f"cs {s['id'][:8]} --{other}"
@@ -2048,19 +2144,22 @@ def resume(s, extra, dry_run, target=None):
             s = dict(s, cwd=HOME)
         if target == "codex" and not shutil.which("codex"):
             sys.exit("codex is not installed (npm install -g @openai/codex)")
-        if not native and dry_run:
-            print(c("2", "→ would " + ("import this conversation into Codex as a new thread" if target == "codex"
-                                       else "write the Codex transcript for Claude to read") + ", then:"))
-        elif not native:
-            try:
-                if target == "codex":
-                    print(c("2", "→ importing this conversation into Codex ..."))
-                    prepared = claude_to_codex(s)
+        try:
+            if not native and target == "codex":
+                tokens, summary, entries = read_claude(s["path"])
+                if tokens <= IMPORT_MAX_TOKENS:
+                    print(c("2", f"→ {'would import' if dry_run else 'importing'} this conversation "
+                                 f"(~{tokens // 1000}k tokens) into Codex as a new thread"))
+                    prepared = ("thread", "<new thread>" if dry_run else claude_to_codex(s))
                 else:
-                    prepared = codex_handoff(s)
-                    print(c("2", f"→ wrote the Codex transcript to {prepared}"))
-            except CodexError as e:
-                sys.exit(f"could not continue in {APP_LABEL[target]}: {e}")
+                    print(c("2", f"→ this conversation is ~{tokens // 1000}k tokens, more than Codex can take "
+                                 f"whole, so Codex starts fresh on Claude's summary plus the recent part"))
+                    prepared = ("transcript", "<transcript>" if dry_run else claude_handoff(s, summary, entries))
+            elif not native:
+                print(c("2", f"→ {'would write' if dry_run else 'writing'} the Codex transcript for Claude to read"))
+                prepared = ("transcript", "<transcript>" if dry_run else codex_handoff(s))
+        except CodexError as e:
+            sys.exit(f"could not continue in {APP_LABEL[target]}: {e}")
     argv, desc = resume_command(s, extra, target, prepared)
     if r and r.get("tmux"):
         print(c("2", f"→ attaching to the tmux window where this session runs: {desc}"))
@@ -2232,7 +2331,7 @@ def self_update():
 def to_json(s):
     keys = ("id", "app", "cwd", "project_dir", "host", "branch", "custom_title", "ai_title", "first", "last",
             "active", "active_win", "days", "user", "assistant", "tools", "model", "ctx_tokens", "todo",
-            "last_said", "last_prompt_ts", "first_prompts", "last_prompts", "group", "chain")
+            "last_said", "last_prompt_ts", "first_prompts", "last_prompts", "group", "chain", "broken")
     return {"name": name(s), "last_prompt": last_prompt(s), "running": running_of(s), "doing": doing(s),
             "daemon": daemon_of(s),
             "jobs": [dict({k: v for k, v in j.items() if k != "sessions"}, status=st, fires_text=text,

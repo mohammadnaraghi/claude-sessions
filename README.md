@@ -116,7 +116,9 @@ nothing until Codex has something new. Picking one runs `codex resume` in its fo
 Any session can also be continued in the other tool:
 
 - `cs 3 --codex` (or `x 3` in the picker) imports a Claude conversation into Codex as a new
-  thread, with the whole history, using Codex's own importer, and opens it.
+  thread, with the whole history, using Codex's own importer, and opens it. A conversation too
+  big for Codex to take whole (over about 150k tokens; Codex models read about 272k) starts a
+  fresh Codex thread on Claude's own summary of the earlier work plus the most recent part.
 - `cs 3 --claude` (or `c 3`) writes the Codex conversation out as a transcript and starts
   Claude Code in the same folder, asking it to read the transcript and say where things stand.
 
