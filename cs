@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
-"""cs - Claude Code session picker.
+"""cs - Claude Code and Codex session picker.
 
-Lists your recent Claude Code sessions across every project folder, and across
-other machines over ssh, shows what each one was about, and resumes the one you
-pick: it cd's into the session's directory and runs `claude --resume <id>`,
-over ssh when the session lives elsewhere. It also shows which sessions are
-running right now and what they are doing, and which ones set up cron jobs.
+Lists your recent Claude Code and Codex CLI sessions across every project
+folder, and across other machines over ssh, shows what each one was about, and
+resumes the one you pick: it cd's into the session's directory and runs
+`claude --resume <id>` or `codex resume <id>`, over ssh when the session lives
+elsewhere. Any session can also be continued in the other tool. It also shows
+which sessions are running right now and what they are doing, and which ones
+set up cron jobs.
 
 Usage
   cs                     interactive picker (last 14 days, >= 10 min of work)
-  cs 3                   resume the 3rd session in that list
+  cs 3                   resume the 3rd session in that list, in its own tool
+  cs 3 --codex           continue it in Codex instead (--claude: in Claude Code).
+                         Claude -> Codex imports the full conversation as a Codex
+                         thread; Codex -> Claude hands Claude its transcript.
   cs tiktok              filter by text; resumes directly on a single match
-                         ("running" and "cron" filter by status, @studio by host)
+                         ("running", "cron", "claude" and "codex" filter by
+                         status or tool, @studio by host)
   cs show 3 | show <id>  details: work per day, prompts, live status, cron jobs
   cs live                running sessions: what they are doing and how far along
   cs jobs                every in-session cron job and its status
@@ -55,17 +61,26 @@ Options
   --local                this machine only, skip configured hosts
   --host LABEL=DEST      query this host too (or only, with --local)
   --tmux | --no-tmux     run local sessions inside tmux too | never use tmux
+  --claude | --codex     continue the chosen session in that tool
+  --no-codex             leave Codex sessions out (they are listed when the
+                         codex CLI is installed)
   --json                 machine-readable output
   -n, --dry-run          print the resume command instead of running it
   --rescan               rebuild the cache from scratch
   --no-fzf               use the built-in picker even if fzf is installed
   -v, --version          print the version
-  -- ARGS                pass ARGS to claude, e.g.  cs 2 -- --model opus
+  -- ARGS                pass ARGS to claude or codex, e.g.  cs 2 -- --model opus
+  CS_CODEX_ARGS          extra arguments for every codex it starts, e.g.
+                         export CS_CODEX_ARGS="-p astra"
+
+Other machines answer within about a second; one that is slower is shown as of
+its last answer and refreshed in the background for next time.
 
 Markers   ● session is running (green = busy, yellow = idle)
           ↻ session set up cron jobs (green = a job is still live)
 
-Inside the picker:  3 = resume #3   s 3 = details   /text = filter
+Inside the picker:  3 = resume #3   c 3 / x 3 = continue #3 in Claude / Codex
+                    s 3 = details   /text = filter
                     n / p = next / previous page     q = quit
 """
 import argparse
@@ -74,14 +89,16 @@ import json
 import math
 import os
 import re
+import select as selectlib
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/claude-sessions/main/cs"
 CLAUDE_DIR = os.environ.get("CS_CLAUDE_DIR") or os.path.expanduser("~/.claude")  # override for tests
 PROJECTS = os.path.join(CLAUDE_DIR, "projects")
@@ -93,7 +110,18 @@ HOME = os.environ.get("CS_HOME") or os.path.expanduser("~")  # override for test
 HOME_RE = re.compile(r"^/(?:Users|home)/[^/]+")
 GAP = 30 * 60  # silence longer than this is not counted as work
 CRON_LIFETIME = timedelta(days=7)  # recurring in-session jobs auto-expire after this
-SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=6"]
+CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+CODEX_CACHE = os.path.join(CACHE_DIR, "codex.json")
+CODEX_CACHE_VERSION = 1
+# files Codex rewrites whenever a thread changes; while none is newer, the cached list is current
+CODEX_STAMP_FILES = ("session_index.jsonl", "state_*.sqlite*", "thread_history_*.sqlite*")
+HANDOFF_DIR = os.path.join(CACHE_DIR, "handoffs")  # Codex transcripts handed to Claude
+HANDOFF_MAX = 60_000
+REMOTE_WAIT = 1.2  # seconds to wait for other machines before showing their last answer
+# Reuse one ssh connection per host for a few minutes, so repeated runs skip the handshake.
+CONTROL_OPTS = (["-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/cs-%C", "-o", "ControlPersist=10m"]
+                if os.path.isdir(os.path.expanduser("~/.ssh")) else [])
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=6", *CONTROL_OPTS]
 # Non-interactive ssh shells have a bare PATH; find cs where the installer puts it.
 REMOTE_CS = "sh -c 'PATH=\"$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; exec cs \"$@\"' cs"
 SKIP_PREFIX = (
@@ -341,7 +369,7 @@ def load_sessions(days, rescan=False):
                 dirty = True
             if not st["first"]:
                 continue
-            out.append(dict(id=ent.name[:-6], path=ent.path, project_dir=proj.name, host=None, **st))
+            out.append(dict(id=ent.name[:-6], path=ent.path, project_dir=proj.name, host=None, app="claude", **st))
     if dirty:
         os.makedirs(CACHE_DIR, exist_ok=True)
         tmp = CACHE + ".tmp"
@@ -349,6 +377,306 @@ def load_sessions(days, rescan=False):
             json.dump(cache, f)
         os.replace(tmp, CACHE)
     return out
+
+
+# ----------------------------------------------------------------- Codex sessions
+
+class CodexError(Exception):
+    pass
+
+
+class CodexServer:
+    """Minimal JSON-RPC client for `codex app-server`, Codex's own API to its sessions."""
+
+    def __init__(self, cwd, timeout=8):
+        try:
+            self.proc = subprocess.Popen(["codex", "app-server"], cwd=cwd, stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError as e:
+            raise CodexError(f"cannot start codex: {e}")
+        self.fd, self.buf, self.next_id, self.notes = self.proc.stdout.fileno(), b"", 0, []
+        try:
+            self.request("initialize", {"clientInfo": {"name": "cs", "title": "cs", "version": VERSION},
+                                        "capabilities": {"experimentalApi": False}}, timeout)
+            self.send({"method": "initialized", "params": {}})
+        except CodexError:
+            self.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def close(self):
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+    def send(self, msg):
+        self.proc.stdin.write((json.dumps(msg) + "\n").encode())
+        self.proc.stdin.flush()
+
+    def read(self, deadline):
+        while b"\n" not in self.buf:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise CodexError("codex did not answer in time")
+            if not selectlib.select([self.fd], [], [], left)[0]:
+                continue
+            chunk = os.read(self.fd, 65536)
+            if not chunk:
+                raise CodexError("codex app-server exited")
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        return json.loads(line) if line.strip() else self.read(deadline)
+
+    def handle(self, msg):
+        if "id" in msg and "method" in msg:  # a request from the server; cs answers none
+            self.send({"id": msg["id"], "error": {"code": -32601, "message": "unsupported"}})
+        elif "method" in msg:
+            self.notes.append(msg)
+
+    def request(self, method, params, timeout=30):
+        self.next_id += 1
+        rid = self.next_id
+        self.send({"id": rid, "method": method, "params": params})
+        deadline = time.monotonic() + timeout
+        while True:
+            msg = self.read(deadline)
+            if msg.get("id") == rid and "method" not in msg:
+                if "error" in msg:
+                    raise CodexError(f"{method}: {msg['error'].get('message', msg['error'])}")
+                return msg.get("result") or {}
+            self.handle(msg)
+
+    def wait_for(self, method, timeout):
+        deadline = time.monotonic() + timeout
+        while True:
+            for note in self.notes:
+                if note.get("method") == method:
+                    self.notes.remove(note)
+                    return note.get("params") or {}
+            self.handle(self.read(deadline))
+
+
+def iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+
+
+def codex_stamp():
+    newest = 0.0
+    for pat in CODEX_STAMP_FILES:
+        for p in glob.glob(os.path.join(CODEX_HOME, pat)):
+            try:
+                newest = max(newest, os.path.getmtime(p))
+            except OSError:
+                pass
+    return newest
+
+
+def item_text(item):
+    return "\n".join(x.get("text", "") for x in item.get("content") or [] if x.get("type") == "text")
+
+
+def codex_state(srv, t):
+    """A Codex thread summarised into the same fields a Claude transcript gets."""
+    st = new_state()
+    st.update(cwd=t.get("cwd"), model=t.get("model"), ai_title=t.get("name") or None, tools=None,
+              branch=(t.get("gitInfo") or {}).get("branch"))
+    turns, cursor = [], None
+    while len(turns) < 5000:
+        params = {"threadId": t["id"], "limit": 200, "itemsView": "summary", "sortDirection": "asc"}
+        if cursor:
+            params["cursor"] = cursor
+        page = srv.request("thread/turns/list", params)
+        turns += page.get("data") or []
+        cursor = page.get("nextCursor")
+        if not cursor:
+            break
+    first, last, prev_end = None, None, None
+    for turn in turns:
+        end = turn.get("completedAt")
+        start = turn.get("startedAt") or (end - (turn.get("durationMs") or 0) / 1000 if end else None)
+        if start is None:
+            continue
+        end = end or start
+        day = datetime.fromtimestamp(start).strftime("%Y-%m-%d")
+        work = max(0.0, end - start)
+        if prev_end is not None and 0 < start - prev_end <= GAP:
+            work += start - prev_end
+        st["active"] += work
+        st["days"][day] = st["days"].get(day, 0) + work
+        prev_end = end
+        first = start if first is None else min(first, start)
+        last = end if last is None else max(last, end)
+        for item in turn.get("items") or []:
+            if item.get("type") == "userMessage":
+                txt = clean_part(item_text(item))
+                if not txt:
+                    continue
+                st["user"] += 1
+                st["last_prompt_ts"] = iso(start)
+                entry = [iso(start), txt[:400]]
+                if len(st["first_prompts"]) < 5:
+                    st["first_prompts"].append(entry)
+                else:
+                    st["last_prompts"] = (st["last_prompts"] + [entry])[-4:]
+            elif item.get("type") == "agentMessage" and (item.get("text") or "").strip():
+                st["assistant"] += 1
+                st["last_said"] = [iso(end), WS_RE.sub(" ", item["text"]).strip()[:300]]
+    st["first"] = iso(first or t.get("createdAt") or 0)
+    st["last"] = iso(max(x for x in (last, t.get("updatedAt"), first, 0) if x is not None))
+    return st
+
+
+def load_codex(days, rescan=False):
+    """-> (Codex sessions touched in the window, note). Read through `codex app-server` only when
+    Codex's own files changed since the last run; otherwise straight from the cache."""
+    if not shutil.which("codex") or not os.path.isdir(CODEX_HOME):
+        return [], None
+    try:
+        with open(CODEX_CACHE) as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        cache = {}
+    if cache.get("__version__") != CODEX_CACHE_VERSION:
+        cache = {}
+    threads, note = cache.get("threads") or {}, None
+    stamp = codex_stamp()
+    horizon = time.time() - days * 86400
+    if rescan or cache.get("stamp") != stamp or cache.get("days", 0) < days:
+        try:
+            fresh, cursor = {}, None
+            with CodexServer(HOME) as srv:
+                while True:
+                    params = {"limit": 50, "sortKey": "updated_at", "sortDirection": "desc",
+                              "sourceKinds": ["cli", "vscode", "appServer"]}
+                    if cursor:
+                        params["cursor"] = cursor
+                    page = srv.request("thread/list", params)
+                    old_enough = False
+                    for t in page.get("data") or []:
+                        updated = t.get("updatedAt") or 0
+                        if updated < horizon:
+                            old_enough = True
+                            break
+                        prev = threads.get(t["id"])
+                        if prev and prev.get("updated") == updated and not rescan:
+                            fresh[t["id"]] = prev
+                        else:
+                            fresh[t["id"]] = {"updated": updated, "st": codex_state(srv, t)}
+                    cursor = page.get("nextCursor")
+                    if old_enough or not cursor:
+                        break
+            threads = fresh
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            tmp = CODEX_CACHE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"__version__": CODEX_CACHE_VERSION, "stamp": stamp, "days": days,
+                           "threads": threads}, f)
+            os.replace(tmp, CODEX_CACHE)
+        except (CodexError, OSError, ValueError) as e:
+            note = f"codex: {e} (showing its sessions as of the last run)"
+    out = [dict(id=tid, path=None, project_dir="", host=None, app="codex", **entry["st"])
+           for tid, entry in threads.items() if entry["updated"] >= horizon]
+    return out, note
+
+
+def claude_to_codex(s):
+    """Import a Claude transcript as a Codex thread (Codex's own importer). -> thread id."""
+    source = os.path.realpath(s["path"])
+    cwd = s.get("cwd") or HOME
+    with CodexServer(cwd, timeout=20) as srv:
+        srv.request("externalAgentConfig/import", {"migrationItems": [{
+            "itemType": "SESSIONS", "description": f"Transfer Claude session {os.path.basename(source)}",
+            "cwd": None,
+            "details": {"plugins": [], "sessions": [{"path": source, "cwd": cwd, "title": None}],
+                        "mcpServers": [], "hooks": [], "subagents": [], "commands": []}}]})
+        done = srv.wait_for("externalAgentConfig/import/completed", 180)
+    for result in done.get("itemTypeResults") or []:
+        for failure in result.get("failures") or []:
+            raise CodexError(f"import failed: {failure.get('message')}")
+    try:
+        with open(os.path.join(CODEX_HOME, "external_agent_session_imports.json")) as f:
+            records = json.load(f).get("records") or []
+    except (OSError, ValueError):
+        records = []
+    ids = [r["imported_thread_id"] for r in records
+           if r.get("source_path") == source and r.get("imported_thread_id")]
+    if not ids:
+        raise CodexError("Codex found nothing to import in that session")
+    return ids[-1]
+
+
+def codex_item_lines(item):
+    kind = item.get("type")
+    if kind == "userMessage":
+        txt = item_text(item).strip()
+        return ["**You:** " + txt] if txt else []
+    if kind == "agentMessage" and (item.get("text") or "").strip():
+        return ["**Codex:** " + item["text"].strip()]
+    if kind == "plan" and item.get("text"):
+        return ["**Plan:**\n" + item["text"].strip()]
+    if kind == "commandExecution":
+        actions = item.get("commandActions") or []
+        cmd = (actions[0].get("command") if actions else None) or item.get("command") or ""
+        code = item.get("exitCode")
+        return [f"- ran `{WS_RE.sub(' ', cmd)[:300]}`" + (f" (exit {code})" if code not in (0, None) else "")]
+    if kind == "fileChange":
+        paths = [ch.get("path") for ch in item.get("changes") or [] if ch.get("path")]
+        return ["- changed " + ", ".join(paths)] if paths else []
+    if kind == "mcpToolCall":
+        return [f"- used {item.get('server')}.{item.get('tool')}"]
+    if kind == "webSearch" and item.get("query"):
+        return ["- searched the web: " + item["query"]]
+    return []
+
+
+def codex_handoff(s):
+    """Write a Codex thread's transcript (its most recent part) for Claude to read. -> path."""
+    blocks, size, cursor, more = [], 0, None, False
+    with CodexServer(s.get("cwd") or HOME) as srv:
+        while not more:
+            params = {"threadId": s["id"], "limit": 25, "itemsView": "full", "sortDirection": "desc"}
+            if cursor:
+                params["cursor"] = cursor
+            page = srv.request("thread/turns/list", params)
+            for turn in page.get("data") or []:
+                text = "\n\n".join(ln for item in turn.get("items") or [] for ln in codex_item_lines(item))
+                if not text:
+                    continue
+                if blocks and size + len(text) > HANDOFF_MAX:
+                    more = True
+                    break
+                blocks.append(text)
+                size += len(text)
+            cursor = page.get("nextCursor")
+            if not cursor:
+                break
+    blocks.reverse()
+    head = [f"# Codex session: {name(s)}", "", f"- Thread: `{s['id']}`", f"- Folder: {s.get('cwd') or '?'}",
+            f"- Model: {s.get('model') or '?'}", f"- Last active: {when(s['last'])}"]
+    if more:
+        head.append(f"- Earlier turns are left out; the whole thread: `codex resume {s['id']}`")
+    os.makedirs(HANDOFF_DIR, exist_ok=True)
+    path = os.path.join(HANDOFF_DIR, s["id"] + ".md")
+    with open(path, "w") as f:
+        f.write("\n".join(head) + "\n\n---\n\n" + "\n\n---\n\n".join(blocks) + "\n")
+    return path
+
+
+def handoff_prompt(path):
+    return (f"I'm switching to you from a Codex (GPT) session in this folder. Its transcript is at "
+            f"{path}. Read it, then tell me in a few lines where that session left off and what is "
+            f"still open. Don't start new work until I say so.")
+
+
+def codex_args():
+    return shlex.split(os.environ.get("CS_CODEX_ARGS", ""))
 
 
 # ----------------------------------------------------------------- live state
@@ -671,7 +999,8 @@ def from_json(o, host):
     s = dict(o)
     s["host"] = host
     for k, v in (("project_dir", ""), ("open_tools", {}), ("todo", None), ("last_said", None),
-                 ("ctx_tokens", 0), ("last_prompt_ts", None), ("branch", None), ("model", None)):
+                 ("ctx_tokens", 0), ("last_prompt_ts", None), ("branch", None), ("model", None),
+                 ("app", "claude")):
         s.setdefault(k, v)
     s["_running"] = o.get("running")
     s["_daemon"] = o.get("daemon")
@@ -683,28 +1012,65 @@ def from_json(o, host):
     return s
 
 
-def fetch_remote(hosts, days):
-    """[(label, sessions, error)] gathered over ssh, hosts queried in parallel."""
-    def one(item):
-        label, dest = item
+def remote_base(label, days):
+    return os.path.join(CACHE_DIR, "remote", re.sub(r"[^A-Za-z0-9_.-]", "_", label) + f"-d{int(days)}")
+
+
+def start_remote(hosts, days):
+    """Ask every host for its sessions in the background. Each answer lands in the cache as a
+    whole file, even if this cs has moved on, so a slow host is current again next time."""
+    os.makedirs(os.path.join(CACHE_DIR, "remote"), exist_ok=True)
+    script = 'ssh "$@" > "$0.tmp" 2> "$0.err" && mv "$0.tmp" "$0.json"'
+    procs = {}
+    for label, dest in hosts.items():
+        base = remote_base(label, days)
+        argv = ["sh", "-c", script, base, *SSH_OPTS, dest, f"{REMOTE_CS} --json --local -a -d {int(days)}"]
         try:
-            p = ssh(dest, f"{REMOTE_CS} --json --local -a -d {int(days)}")
-        except subprocess.TimeoutExpired:
-            return label, [], "timed out"
-        except OSError as e:
-            return label, [], str(e)
-        if p.returncode != 0:
-            err = (p.stderr.strip().splitlines() or ["ssh failed"])[-1]
-            if "not found" in err:
-                err = f"cs is not installed there, run: cs hosts setup {label}"
-            return label, [], err
+            procs[label] = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            procs[label] = None
+    return {"procs": procs, "days": days, "started": time.monotonic()}
+
+
+def finish_remote(pending, wait=REMOTE_WAIT):
+    """[(label, sessions, note)]: fresh answers from hosts that replied within `wait` seconds,
+    the last answer from the others."""
+    deadline = pending["started"] + wait
+    for p in pending["procs"].values():
+        if p is not None:
+            try:
+                p.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
+    out = []
+    for label, p in pending["procs"].items():
+        base = remote_base(label, pending["days"])
+        code = p.poll() if p is not None else 255
+        note = None
+        if code not in (0, None):
+            try:
+                with open(base + ".err") as f:
+                    err = (f.read().strip().splitlines() or ["ssh failed"])[-1]
+            except OSError:
+                err = "ssh failed"
+            note = f"cs is not installed there, run: cs hosts setup {label}" if "not found" in err else err
+        sessions, asof = [], None
         try:
-            data = json.loads(p.stdout)
-        except ValueError:
-            return label, [], f"unexpected output, run: cs hosts setup {label}"
-        return label, [from_json(o, label) for o in data], None
-    with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as ex:
-        return list(ex.map(one, hosts.items()))
+            with open(base + ".json") as f:
+                sessions = [from_json(o, label) for o in json.load(f)]
+            asof = rel(iso(os.path.getmtime(base + ".json")))
+        except (OSError, ValueError):
+            if code == 0:
+                note = f"unexpected output, run: cs hosts setup {label}"
+        stale = code != 0 and sessions
+        if code is None:
+            note = (f"slow to answer, showing its sessions as of {asof}" if stale
+                    else "slow to answer, skipped this time (refreshing in the background)")
+        elif note and stale:
+            note += f"; showing its sessions as of {asof}"
+        out.append((label, sessions, note))
+    return out
 
 
 def host_check(dest):
@@ -1202,6 +1568,10 @@ def matches(s, query):
             if not s["jobs"]:
                 return False
             continue
+        if w in ("claude", "codex"):
+            if s.get("app", "claude") != w:
+                return False
+            continue
         if hay is None:
             hay = " ".join([s["id"], project(s), name(s), s.get("ai_title") or "", last_prompt(s),
                             s.get("host") or ""]
@@ -1298,6 +1668,14 @@ def where(s):
     return c("35", "@" + s["host"]) if is_remote(s) else ""
 
 
+def app_of(s):
+    return s.get("app") or "claude"
+
+
+APP_LABEL = {"claude": "Claude Code", "codex": "Codex"}
+APP_COLOR = {"claude": "33", "codex": "34"}
+
+
 def print_list(view, start=0, count=None):
     """One row per session, columns sized to the terminal width."""
     cols, _ = term()
@@ -1307,22 +1685,27 @@ def print_list(view, start=0, count=None):
     gutter = "   "
     show_proj = cols >= 100
     show_work = cols >= 80
+    show_app = any(app_of(s) != "claude" for s in view)
     hw = max([4] + [len(h) for h in HOSTS]) if HOSTS else 0
     nw = min(38, max(len(name(s)) for s in rows))
     pw = min(18, max(len(short_project(s)) for s in rows)) if show_proj else 0
     fixed = 3 + len(gutter) + 2 + len(gutter) + 7 + len(gutter) + nw + len(gutter)
     if hw:
         fixed += hw + len(gutter)
+    if show_app:
+        fixed += 6 + len(gutter)
     if show_work:
         fixed += 5 + len(gutter)
     if show_proj:
         fixed += pw + len(gutter)
     lw = max(16, cols - fixed - 1)
 
-    def row(idx, flag, host, last, work, nm, proj, prompt, header=False):
+    def row(idx, flag, host, app, last, work, nm, proj, prompt, header=False):
         cells = [(f"{idx:>3}", "1;36"), (flag, None)]
         if hw:
             cells.append((f"{host:<{hw}}", "35"))
+        if show_app:
+            cells.append((f"{app:<6}", APP_COLOR.get(app, "")))
         cells.append((f"{last:<7}", "32" if ("m ago" in last or "h ago" in last) else ""))
         if show_work:
             cells.append((f"{work:>5}", ""))
@@ -1334,10 +1717,10 @@ def print_list(view, start=0, count=None):
             return c("2", gutter.join(t for t, _ in cells))
         return gutter.join(t if code is None else (c(code, t) if code else t) for t, code in cells)
 
-    print(row("#", "  ", "host", "last", "work", "session", "project", "last prompt", header=True))
+    print(row("#", "  ", "host", "app", "last", "work", "session", "project", "last prompt", header=True))
     for i, s in enumerate(rows, start + 1):
-        print(row(i, flags(s), s.get("host") or "", rel(s["last"]), hm(s["active_win"]), fit(name(s), nw),
-                  fit(short_project(s), pw), fit(last_prompt(s), lw)))
+        print(row(i, flags(s), s.get("host") or "", app_of(s), rel(s["last"]), hm(s["active_win"]),
+                  fit(name(s), nw), fit(short_project(s), pw), fit(last_prompt(s), lw)))
 
 
 def live_block(s, indent="   "):
@@ -1389,15 +1772,39 @@ def live_block(s, indent="   "):
 
 
 TMUX_MODE = "auto"  # auto: remote sessions run inside tmux when it exists; always: local ones too; never
+DAYS = 14
 
 
-def resume_command(s, extra):
+def local_argv(s, target, extra, prepared=None):
+    """argv that continues s in `target` here. prepared: the imported Codex thread id
+    (Claude -> Codex) or the transcript path (Codex -> Claude)."""
+    if target == "claude":
+        claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+        if app_of(s) == "claude":
+            return [claude, "--resume", s["id"], *extra]
+        return [claude, "--add-dir", HANDOFF_DIR, handoff_prompt(prepared or "<transcript>"), *extra]
+    codex = shutil.which("codex") or "codex"
+    thread = s["id"] if app_of(s) == "codex" else (prepared or "<new thread>")
+    return [codex, *codex_args(), "resume", thread, *extra]
+
+
+def resume_command(s, extra, target=None, prepared=None):
     """(argv, description) that resumes or attaches to the session, locally or over ssh."""
-    r = running_of(s)
+    target = target or app_of(s)
+    native = target == app_of(s)
+    r = running_of(s) if native else None
     cwd = s.get("cwd") or "~"
     extra_q = " ".join(shlex.quote(e) for e in extra)
-    claude_cmd = f"cd {shlex.quote(cwd)} && claude --resume {s['id']} {extra_q}".rstrip()
-    tname = "cs-" + s["id"][:8]
+    if is_remote(s) and not (native and target == "claude"):
+        # the other machine's cs does the work there (importing, writing the transcript)
+        claude_cmd = (f"cs {s['id']} --{target} --local --no-tmux -a -d {int(DAYS)}"
+                      + (f" -- {extra_q}" if extra else ""))
+    elif is_remote(s):
+        claude_cmd = f"cd {shlex.quote(cwd)} && claude --resume {s['id']} {extra_q}".rstrip()
+    else:
+        argv = local_argv(s, target, extra, prepared)
+        claude_cmd = f"cd {shlex.quote(cwd)} && {shlex.join(argv)}"
+    tname = "cs-" + s["id"][:8] + ("" if native else "-" + target)
     if is_remote(s):
         dest = HOSTS.get(s["host"], s["host"])
         # the usual homes of claude and tmux, in case the remote shell's own PATH lacks them
@@ -1415,7 +1822,8 @@ def resume_command(s, extra):
         else:
             inner, desc = path + claude_cmd, claude_cmd
         # an interactive login shell on the other side, so the user's own PATH applies too
-        return ["ssh", "-t", dest, f'"$SHELL" -lic {shlex.quote(inner)}'], f"ssh -t {dest} '{desc}'"
+        return (["ssh", "-t", *CONTROL_OPTS, dest, f'"$SHELL" -lic {shlex.quote(inner)}'],
+                f"ssh -t {dest} '{desc}'")
     if r and r.get("tmux"):
         verb = "switch-client" if os.environ.get("TMUX") else "attach"
         return ["tmux", verb, "-t", r["tmux"]], f"tmux {verb} -t {r['tmux']}"
@@ -1426,8 +1834,8 @@ def resume_command(s, extra):
         else:
             argv = ["tmux", "new-session", "-A", "-s", tname, claude_cmd]
         return argv, f"tmux new-session -A -s {tname} '{claude_cmd}'"
-    claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
-    return [claude, "--resume", s["id"], *extra], f"cd {project(s)} && claude --resume {s['id']} {extra_q}".rstrip()
+    argv = local_argv(s, target, extra, prepared)
+    return argv, f"cd {project(s)} && {shlex.join([target, *argv[1:]])}"
 
 
 def show(s):
@@ -1435,13 +1843,14 @@ def show(s):
     last = parse_ts(s["last"]).astimezone()
     days = " · ".join(f"{d[5:]} {hm(v / 60)}" for d, v in sorted(s["days"].items()) if v >= 60)
     print(c("1", f"Name     {name(s)}") + (c("2", f"   (auto title: {subtitle(s)})") if subtitle(s) else ""))
-    print(f"Session  {s['id']}")
+    print(f"Session  {s['id']}  " + c(APP_COLOR[app_of(s)], f"({APP_LABEL[app_of(s)]})"))
     if is_remote(s):
         print(f"Host     {s['host']}  ({HOSTS.get(s['host'], s['host'])})")
     print(f"Project  {project(s)}" + (f"  (branch {s['branch']})" if s.get("branch") else ""))
     print(f"Started  {first:%a %b %d %H:%M}    Last active  {last:%a %b %d %H:%M}  ({rel(s['last'])})")
     print(f"Work     {hm(s['active'] / 60)} total · {days}")
-    print(f"Volume   {s['user']} prompts · {s['assistant']} replies · {s['tools']} tool calls"
+    print(f"Volume   {s['user']} prompts · {s['assistant']} replies"
+          + (f" · {s['tools']} tool calls" if s.get("tools") is not None else "")
           + (f" · {s['model']}" if s.get("model") else ""))
     lb = live_block(s, indent="")
     if lb:
@@ -1463,6 +1872,10 @@ def show(s):
         for ts, p in s["last_prompts"]:
             print(f"  {parse_ts(ts).astimezone():%b %d %H:%M}  {fit(p, 200)}")
     print(c("1", "Resume   ") + resume_command(s, [])[1])
+    other = "codex" if app_of(s) == "claude" else "claude"
+    print(c("1", APP_LABEL[other].split()[0].ljust(9)) + f"cs {s['id'][:8]} --{other}"
+          + c("2", "   (imports the conversation into a Codex thread)" if other == "codex"
+              else "   (Claude reads the Codex transcript and picks up)"))
 
 
 def live_view(sessions):
@@ -1516,19 +1929,37 @@ def jobs_view(sessions):
               f"{c('1', fit(label(s), nw).ljust(nw))}   {fit(j.get('prompt') or '', max(10, rest))}")
 
 
-def resume(s, extra, dry_run):
-    r = running_of(s)
+def resume(s, extra, dry_run, target=None):
+    target = target or app_of(s)
+    native = target == app_of(s)
+    r = running_of(s) if native else None
+    prepared = None
     if not is_remote(s):
         cwd = s.get("cwd")
         if not cwd or not os.path.isdir(cwd):
             print(c("33", f"warning: {cwd} no longer exists, starting from {HOME}"))
             s = dict(s, cwd=HOME)
-    argv, desc = resume_command(s, extra)
+        if target == "codex" and not shutil.which("codex"):
+            sys.exit("codex is not installed (npm install -g @openai/codex)")
+        if not native and dry_run:
+            print(c("2", "→ would " + ("import this conversation into Codex as a new thread" if target == "codex"
+                                       else "write the Codex transcript for Claude to read") + ", then:"))
+        elif not native:
+            try:
+                if target == "codex":
+                    print(c("2", "→ importing this conversation into Codex ..."))
+                    prepared = claude_to_codex(s)
+                else:
+                    prepared = codex_handoff(s)
+                    print(c("2", f"→ wrote the Codex transcript to {prepared}"))
+            except CodexError as e:
+                sys.exit(f"could not continue in {APP_LABEL[target]}: {e}")
+    argv, desc = resume_command(s, extra, target, prepared)
     if r and r.get("tmux"):
         print(c("2", f"→ attaching to the tmux window where this session runs: {desc}"))
     else:
         if r:
-            print(c("33", "note: this session is already running elsewhere; this starts a second claude on it"))
+            print(c("33", f"note: this session is already running elsewhere; this starts a second {target} on it"))
         print(c("2", f"→ {desc}"))
         if "tmux new-session" in desc:
             print(c("2", "   runs inside tmux: closing this terminal or the laptop only detaches it; "
@@ -1543,27 +1974,34 @@ def resume(s, extra, dry_run):
 # ----------------------------------------------------------------- pickers
 
 def pick_fzf(view, self_path):
+    """-> (session, target tool) or None."""
     lines = []
+    apps = any(app_of(s) != "claude" for s in view)
     for s in view:
         r = running_of(s)
         mark = ("●" if r else " ") + ("↻" if s["jobs"] else " ")
         host = f"{(s.get('host') or ''):<8}" if HOSTS else ""
-        lines.append("\t".join([s["id"], mark + ("  " + host if host else ""), f"{rel(s['last']):<7}",
+        lines.append("\t".join([s["id"], mark + ("  " + host if host else ""),
+                                *([f"{app_of(s):<6}"] if apps else []), f"{rel(s['last']):<7}",
                                 f"{hm(s['active_win']):>5}", fit(name(s), 38).ljust(38),
                                 fit(short_project(s), 18).ljust(18), last_prompt(s)]))
     try:
         res = subprocess.run(
             ["fzf", "--delimiter=\t", "--with-nth=2..", "--no-sort", "--tabstop=1",
-             "--header=enter = resume · ctrl-c = quit · ● running · ↻ cron jobs",
+             "--expect=alt-c,alt-x",
+             "--header=enter = resume · alt-c / alt-x = continue in Claude / Codex · ctrl-c = quit"
+             " · ● running · ↻ cron jobs",
              "--preview", f"{sys.executable} {self_path} show {{1}}",
              "--preview-window=down,55%,wrap"],
             input="\n".join(lines), capture_output=True, text=True)
     except FileNotFoundError:
         return None
-    if res.returncode != 0 or not res.stdout.strip():
+    out = res.stdout.split("\n", 1)
+    if res.returncode != 0 or len(out) < 2 or not out[1].strip():
         return None
-    sid = res.stdout.split("\t", 1)[0].strip()
-    return next((s for s in view if s["id"] == sid), None)
+    sid = out[1].split("\t", 1)[0].strip()
+    s = next((s for s in view if s["id"] == sid), None)
+    return (s, {"alt-c": "claude", "alt-x": "codex"}.get(out[0].strip())) if s else None
 
 
 def clear():
@@ -1573,6 +2011,7 @@ def clear():
 
 
 def pick_builtin(view_all, query, notes):
+    """-> (session, target tool) or None."""
     flt, page = query, 0
     while True:
         view = [s for s in view_all if matches(s, flt)] if flt else view_all
@@ -1593,7 +2032,8 @@ def pick_builtin(view_all, query, notes):
         status = f"{len(view)} sessions"
         if pages > 1:
             status += f" · page {page + 1}/{pages} · n / p to page"
-        print(c("2", f"{status} · number = resume · s # = details · /text = filter · q = quit · ● running · ↻ cron"))
+        print(c("2", f"{status} · number = resume · c # / x # = continue in Claude / Codex · s # = details"
+                     f" · /text = filter · q = quit · ● running · ↻ cron"))
         try:
             ans = input(c("1", "> ")).strip()
         except (EOFError, KeyboardInterrupt):
@@ -1625,10 +2065,11 @@ def pick_builtin(view_all, query, notes):
                     print()
                     return None
             continue
-        if ans.isdigit():
-            idx = int(ans)
+        m = re.fullmatch(r"(?:([cx])\s*)?(\d+)", ans)
+        if m:
+            idx = int(m.group(2))
             if 1 <= idx <= len(view):
-                return view[idx - 1]
+                return view[idx - 1], {"c": "claude", "x": "codex"}.get(m.group(1))
             continue
         flt, page = ans, 0
 
@@ -1682,7 +2123,7 @@ def self_update():
 
 
 def to_json(s):
-    keys = ("id", "cwd", "project_dir", "host", "branch", "custom_title", "ai_title", "first", "last",
+    keys = ("id", "app", "cwd", "project_dir", "host", "branch", "custom_title", "ai_title", "first", "last",
             "active", "active_win", "days", "user", "assistant", "tools", "model", "ctx_tokens", "todo",
             "last_said", "last_prompt_ts", "first_prompts", "last_prompts")
     return {"name": name(s), "last_prompt": last_prompt(s), "running": running_of(s), "doing": doing(s),
@@ -1694,7 +2135,7 @@ def to_json(s):
 
 
 def main():
-    global _ALL_SESSIONS, HOSTS, TMUX_MODE
+    global _ALL_SESSIONS, HOSTS, TMUX_MODE, DAYS
     argv = sys.argv[1:]
     if argv[:1] == ["_export"]:  # called over ssh by another machine's cs
         items = argv[argv.index("--items") + 1].split(",") if "--items" in argv else ["memory", "configs"]
@@ -1717,6 +2158,9 @@ def main():
     ap.add_argument("--host", action="append", default=[])
     ap.add_argument("--tmux", action="store_true")
     ap.add_argument("--no-tmux", action="store_true")
+    ap.add_argument("--claude", action="store_true")
+    ap.add_argument("--codex", action="store_true")
+    ap.add_argument("--no-codex", action="store_true")
     ap.add_argument("--memory", action="store_true")
     ap.add_argument("--configs", action="store_true")
     ap.add_argument("--prefer", choices=["newest", "local", "remote"], default="newest")
@@ -1760,24 +2204,35 @@ def main():
         return
     if a.all:
         a.min = 0
+    if a.claude and a.codex:
+        sys.exit("pick one of --claude and --codex")
+    target = "claude" if a.claude else "codex" if a.codex else None
     TMUX_MODE = "never" if a.no_tmux else "always" if a.tmux else "auto"
+    DAYS = a.days
 
-    local = load_sessions(a.days, a.rescan)
-    _ALL_SESSIONS = local
-    sessions = list(local)
     HOSTS = {}
     if a.host or not a.local:
         HOSTS = load_hosts(a.host)
         if a.local:  # --local --host X: only the hosts named on the command line
             named = {h.partition("=")[0] for h in a.host}
             HOSTS = {k: v for k, v in HOSTS.items() if k in named}
-    notes = []
-    if HOSTS:
-        for label, remote, err in fetch_remote(HOSTS, a.days):
-            if err:
-                notes.append(f"{label}: {err}")
-            else:
-                sessions += remote
+    # `cs show <id>` (the fzf preview runs it per line) needs no other machine if the id is here
+    lookup = rest[1] if rest[:1] in (["show"], ["path"]) and len(rest) == 2 and not rest[1].isdigit() else None
+    pending = start_remote(HOSTS, a.days) if HOSTS and not lookup else None
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        codex_job = None if a.no_codex else ex.submit(load_codex, a.days, a.rescan)
+        local = load_sessions(a.days, a.rescan)
+        codex, codex_note = codex_job.result() if codex_job else ([], None)
+    _ALL_SESSIONS = local
+    sessions = local + codex
+    notes = [codex_note] if codex_note else []
+    if lookup and HOSTS and len([s for s in sessions if s["id"].startswith(lookup)]) != 1:
+        pending = start_remote(HOSTS, a.days)
+    if pending:
+        for label, remote, note in finish_remote(pending):
+            sessions += remote
+            if note:
+                notes.append(f"{label}: {note}")
     if notes and not a.json:
         for n in notes:
             print(c("33", n), file=sys.stderr)
@@ -1811,12 +2266,12 @@ def main():
 
     query = " ".join(rest)
     if query.isdigit():
-        resume(find(view, sessions, query), extra, a.dry_run)
+        resume(find(view, sessions, query), extra, a.dry_run, target)
         return
     if query:
         hits = [s for s in view if matches(s, query)]
         if len(hits) == 1 and not a.print:
-            resume(hits[0], extra, a.dry_run)
+            resume(hits[0], extra, a.dry_run, target)
             return
     else:
         hits = view
@@ -1835,7 +2290,8 @@ def main():
     else:
         chosen = pick_builtin(hits, query if len(hits) != len(view) else "", notes)
     if chosen:
-        resume(chosen, extra, a.dry_run)
+        s, picked = chosen
+        resume(s, extra, a.dry_run, picked or target)
 
 
 if __name__ == "__main__":

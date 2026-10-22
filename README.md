@@ -1,7 +1,7 @@
 <h1 align="center">cs</h1>
 
 <p align="center">
-  Find, watch and resume every <a href="https://claude.com/claude-code">Claude Code</a> session you have, on every machine you own.
+  Find, watch and resume every <a href="https://claude.com/claude-code">Claude Code</a> and Codex session you have, on every machine you own.
 </p>
 
 <p align="center">
@@ -29,6 +29,8 @@ it lives on another computer.
   what it is doing this second, the last thing it said, and how far through its checklist it is.
 - **Scheduled jobs, tracked.** Sessions that set up cron jobs are marked. You see the schedule,
   how many times it has fired, and whether it is still alive or died with the terminal.
+- **Claude Code and Codex in one list.** If you also use the Codex CLI, its sessions show up
+  beside your Claude ones, and any session can be continued in the other tool.
 - **Your other computers too.** Add a machine once; its sessions join the list. Resuming one
   opens it there over ssh. Sessions running inside tmux are attached, not duplicated.
 - **Memories and settings travel with you.** Keep two machines in step with one command,
@@ -105,6 +107,22 @@ and tmux on the other machine for the keep-running part (`brew install tmux` or
 
 Want the same safety on this machine? `cs --tmux 3` runs a local session inside tmux too.
 
+## Claude Code and Codex
+
+When the [Codex CLI](https://github.com/openai/codex) is installed, its sessions join the list
+with an `app` column, read through Codex's own `codex app-server` and cached, so they cost
+nothing until Codex has something new. Picking one runs `codex resume` in its folder.
+
+Any session can also be continued in the other tool:
+
+- `cs 3 --codex` (or `x 3` in the picker) imports a Claude conversation into Codex as a new
+  thread, with the whole history, using Codex's own importer, and opens it.
+- `cs 3 --claude` (or `c 3`) writes the Codex conversation out as a transcript and starts
+  Claude Code in the same folder, asking it to read the transcript and say where things stand.
+
+`cs codex` and `cs claude` filter the list by tool. Set `CS_CODEX_ARGS` to pass flags to every
+Codex that `cs` starts, for example `export CS_CODEX_ARGS="-p work"` for a profile.
+
 ## Keep two machines in sync
 
 <p align="center">
@@ -131,8 +149,10 @@ deletes nothing.
 |---|---|
 | `cs` | the picker: last two weeks, newest first |
 | `cs 3` | resume number 3 |
+| `cs 3 --codex` · `cs 3 --claude` | continue number 3 in Codex · in Claude Code |
 | `cs tiktok` | filter by any word; resumes at once if only one matches |
 | `cs running` · `cs cron` · `cs @studio` | only running sessions, only sessions with jobs, only one machine |
+| `cs codex` · `cs claude` | only Codex sessions · only Claude Code sessions |
 | `cs live` | what every open session is doing |
 | `cs jobs` | every scheduled job and its status |
 | `cs show 3` | the full story of one session |
@@ -141,10 +161,11 @@ deletes nothing.
 | `cs migrate to NAME` | set up a new machine from this one |
 | `cs -d 30` · `cs -a` | look back 30 days · show every session, however short |
 | `cs --tmux 3` | run a local session inside tmux so it survives closing the window |
-| `cs 3 -- --model opus` | pass extra flags to Claude Code |
+| `cs 3 -- --model opus` | pass extra flags to Claude Code (or Codex) |
 
-Inside the picker: a number resumes, `s 3` shows details, `/text` filters, `n` and `p` page,
-`q` quits.
+Inside the picker: a number resumes, `c 3` and `x 3` continue in Claude Code or Codex, `s 3`
+shows details, `/text` filters, `n` and `p` page, `q` quits. With fzf: enter resumes, alt-c and
+alt-x continue in Claude Code or Codex.
 
 ## Questions
 
@@ -156,19 +177,22 @@ only network traffic is ssh to machines you added yourself, and the update check
 tied to an account, so `cs` sees all of them and resumes any of them.
 
 **Will it slow things down?** The first run reads your history once, a few seconds. After that
-it opens instantly, and asking another machine adds well under a second.
+it opens instantly. Other machines get about a second to answer; one that is asleep or slow is
+shown as of its last answer while a fresh one is fetched in the background, and the ssh
+connection is kept open for a few minutes so the next run skips the handshake.
 
 **Can I name my machines whatever I want?** Yes. The name is just a label you type; the ssh
 address can be a hostname, an IP, or an alias from your ssh config.
 
-**Does resuming change anything?** No. `cs` runs the same `claude --resume` you would type
-yourself, in the session's own folder.
+**Does resuming change anything?** No. `cs` runs the same `claude --resume` or
+`codex resume` you would type yourself, in the session's own folder. Continuing in the other
+tool creates a new session there and leaves the original untouched.
 
 ## Requirements
 
 - macOS or Linux
 - Python 3.8 or newer, which both already have
-- Claude Code
+- Claude Code, and optionally the Codex CLI
 
 ## License
 
