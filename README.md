@@ -28,6 +28,8 @@ even when it lives on another computer, and in either tool.
 - **Claude Code and Codex in one list.** If you also use the Codex CLI, its sessions show up
   beside your Claude ones, and any session can be continued in the other tool. A conversation
   that moved between the two stays one row and opens wherever you worked on it last.
+- **One memory for both tools.** The companion `ai-bridge` shares memories and MCP servers
+  between Claude Code and Codex, with nothing to run once it is set up.
 - **See what is running.** `s live` shows each open session: busy or idle, what you asked,
   what it is doing this second, the last thing it said, and how far through its checklist it is.
 - **Scheduled jobs, tracked.** Sessions that set up cron jobs are marked. You see the schedule,
@@ -36,8 +38,8 @@ even when it lives on another computer, and in either tool.
   opens it there over ssh. Sessions running inside tmux are attached, not duplicated.
 - **Memories and settings travel with you.** Keep two machines in step with one command,
   in both directions, with a plan shown first and backups kept.
-- **Private by design.** One Python file, no dependencies, no accounts, no servers. It reads
-  what Claude Code and Codex already store on your disk and talks only to machines you name.
+- **Private by design.** Plain Python files, no dependencies, no accounts, no servers. They read
+  what Claude Code and Codex already store on your disk and talk only to machines you name.
 
 ## Install
 
@@ -45,12 +47,13 @@ even when it lives on another computer, and in either tool.
 curl -fsSL https://raw.githubusercontent.com/mohammadnaraghi/sessions/main/install.sh | sh
 ```
 
-That is the whole setup. It needs `python3` and Claude Code, puts one file, `s`, in
-`~/.local/bin`, and tells you if that folder is not on your `PATH` yet. Open a new terminal and
-type `s`.
+That is the whole setup. It needs `python3` and Claude Code, puts `s` in `~/.local/bin` (with
+its companion `ai-bridge`, which does nothing until you run its setup; see
+[below](#shared-memory-between-claude-code-and-codex)), and tells you if that folder is not on
+your `PATH` yet. Open a new terminal and type `s`.
 
-- Update any time with `s update`
-- Remove with `rm ~/.local/bin/s`
+- Update any time with `s update` (it updates `ai-bridge` too)
+- Remove with `rm ~/.local/bin/s ~/.local/bin/ai-bridge`
 
 If you have [fzf](https://github.com/junegunn/fzf) installed, `s` uses it automatically for
 fuzzy search with a live preview.
@@ -119,6 +122,46 @@ imports, and a session that read the other tool's transcript to pick up where it
 `s codex` and `s claude` filter the list by tool. Set `SESSIONS_CODEX_ARGS` to pass flags to
 every Codex that `s` starts, for example `export SESSIONS_CODEX_ARGS="-p work"` for a profile.
 
+## Shared memory between Claude Code and Codex
+
+`ai-bridge`, installed next to `s`, makes the two tools work as one. Run it once:
+
+```sh
+ai-bridge setup                       # or: ai-bridge setup --model gpt-6.1-sol
+```
+
+From then on there is nothing to run. You start `claude` or `codex` as usual, anywhere, and:
+
+- **Codex knows what Claude knows.** Each Codex session starts with Claude Code's memories for
+  that project, and saves what it learns in Claude's own memory format.
+- **Claude learns what Codex learned.** When Claude Code starts in a project, Codex's new
+  memories are added to its memory, and Claude is told about them.
+- **One set of MCP servers.** The MCP servers you add to Claude Code are copied into Codex: your
+  own ones into `~/.codex/config.toml`, a project's `.mcp.json` and local servers into that
+  project's `.codex/config.toml` (kept out of git). Servers that log in with OAuth need
+  `codex mcp login NAME` once.
+- **Pick up where the other left off.** Each tool is told about the other's latest session in
+  the folder; ask it to continue where Claude or Codex left off and it reads the transcript.
+- **Your model by default.** In zsh, `codex` starts with the bridge's profile (GPT-6 Astra, or
+  the `--model` you gave setup), and so do the Codex sessions `s` starts.
+
+| Command | What it does |
+|---|---|
+| `mem` | what each tool remembers about this folder, and what Codex saved since |
+| `mem pull` · `mem show` | move Codex's new memories into Claude now · see what Codex is given |
+| `to-codex` · `to-claude` | continue this folder's latest session in the other tool (like `s N --codex` / `--claude`) |
+| `cx` | `codex` with the bridge's profile, from shells other than zsh |
+| `ai-bridge sync` | copy Claude's MCP servers into Codex now |
+| `ai-bridge update` | the latest release (`s update` does this too) |
+
+Setup links those commands next to `ai-bridge` and edits, after backing each one up as
+`*.bak-ai-bridge-<time>`: a SessionStart hook in `~/.claude/settings.json`, a SessionStart hook
+in `~/.codex/hooks.json` (Codex asks you to trust it the first time), a marked block in
+`~/.zshrc`, and `~/.codex/config.toml` (Codex may write its memories, and reads `CLAUDE.md` when
+a repository has no `AGENTS.md`). To undo it, remove those hook entries and the marked blocks.
+`s hosts setup NAME` copies `ai-bridge` to that machine as well and refreshes it there when it
+is already set up.
+
 ## Your other computers
 
 ```sh
@@ -181,6 +224,8 @@ deletes nothing.
 | `s -d 30` · `s -a` | look back 30 days · show every session, however short |
 | `s --tmux 3` | run a local session inside tmux so it survives closing the window |
 | `s 3 -- --model opus` | pass extra flags to Claude Code (or Codex) |
+| `ai-bridge setup` | share memory and MCP servers between Claude Code and Codex (once) |
+| `mem` | what Claude and Codex remember about this folder |
 
 Inside the picker: a number resumes, `c 3` and `x 3` continue in Claude Code or Codex, `s 3`
 shows details, `/text` filters, `n` and `p` page, `q` quits. With fzf: enter resumes, alt-c and
@@ -213,7 +258,7 @@ project is called sessions.
 ## Requirements
 
 - macOS or Linux
-- Python 3.8 or newer, which both already have
+- Python 3.8 or newer, which both already have (3.11 or newer for `ai-bridge setup`)
 - Claude Code, and optionally the Codex CLI
 
 ## License

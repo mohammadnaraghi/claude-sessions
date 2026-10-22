@@ -1,0 +1,1308 @@
+#!/usr/bin/env python3
+"""ai-bridge - shared memory, MCP servers and sessions between Claude Code and Codex.
+
+Part of sessions (https://github.com/mohammadnaraghi/sessions), next to the `s` picker.
+Nothing to run day to day once set up: start `claude` or `codex` as usual.
+  - Codex sees Claude's memories for the folder (a Codex SessionStart hook), and
+    saves what it learns to an inbox in Claude's memory format.
+  - Claude pulls that inbox into its memory when it starts (a Claude
+    SessionStart hook), and is told about the latest Codex session in the
+    folder; Codex is told about the latest Claude session. Say "continue where
+    Codex/Claude left off" and they read the other's transcript.
+  - Claude's MCP servers are copied into Codex's config (user scope into
+    ~/.codex/config.toml, a project's .mcp.json and local servers into
+    <project>/.codex/config.toml). Add or remove MCP servers in Claude.
+  - In zsh, `codex` starts the bridge's Codex profile (GPT-6 Astra unless setup
+    was given --model) unless you pass -p/--profile or -m/--model; `s` uses it
+    too (SESSIONS_CODEX_ARGS).
+
+Optional commands
+  cx [codex args]       same as `codex` with the bridge's profile
+  to-codex [id|path]    resume this folder's latest Claude session as a real
+                        Codex thread (full history, via Codex's importer)
+  to-claude [thread]    continue this folder's latest Codex session in Claude
+  mem                   shared-memory status for this folder
+  mem pull [-n] [--all] copy Codex's new memories into Claude's memory now
+  mem show              print exactly what Codex is given at session start
+  ai-bridge sync        copy Claude's MCP servers into Codex now
+  ai-bridge claude-transcript [id] / codex-transcript [thread]
+                        print a session as markdown (what the tools read)
+
+  --print on to-codex / to-claude prints the command instead of running it.
+
+Setup (idempotent; every file it edits is backed up as *.bak-ai-bridge-<time>)
+  ai-bridge setup [--model M]
+                        links cx/mem/to-codex/to-claude next to this script,
+                        writes ~/.codex/astra.config.toml (model M, default
+                        gpt-6-astra), the Codex hook (~/.codex/hooks.json),
+                        the Claude hook (~/.claude/settings.json), the zsh
+                        `codex` wrapper (~/.zshrc), and Codex config.toml
+                        settings
+  ai-bridge update      replace this script with the latest release
+                        (`s update` does it too)
+
+Files
+  ~/.claude/projects/<project>/memory/     Claude's memory; Codex reads it
+  ~/.codex/shared-memory/inbox/<project>/  memories Codex saved, until pulled
+  ~/.codex/shared-memory/handoffs/         Codex transcripts handed to Claude
+"""
+
+import datetime
+import json
+import os
+import re
+import select
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+VERSION = "0.3.0"
+UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/sessions/main/ai-bridge"
+HOME = Path.home()
+CLAUDE_PROJECTS = HOME / ".claude" / "projects"
+CLAUDE_JSON = HOME / ".claude.json"
+CLAUDE_SETTINGS = HOME / ".claude" / "settings.json"
+CODEX_HOME = Path(os.environ.get("CODEX_HOME") or HOME / ".codex")
+SHARED = CODEX_HOME / "shared-memory"
+INBOX = SHARED / "inbox"
+HANDOFFS = SHARED / "handoffs"
+ZSHRC = HOME / ".zshrc"
+SCRIPT = Path(__file__).resolve()
+ASTRA_PROFILE = "astra"
+ASTRA_MODEL = "gpt-6-astra"
+INDEX_MAX_LINES = 200  # Claude loads the first 200 lines or 25KB of MEMORY.md
+INDEX_MAX_BYTES = 25_000
+HANDOFF_MAX_CHARS = 60_000
+IMPORT_MAX_TOKENS = 150_000  # bigger Claude conversations go to Codex as summary + recent part
+RECENT_DAYS = 14
+SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.md$")
+MCP_BEGIN = "# >>> ai-bridge: MCP servers copied from Claude Code (edit them in Claude) >>>"
+MCP_END = "# <<< ai-bridge MCP <<<"
+ZSH_BEGIN = "# >>> ai-bridge >>>"
+ZSH_END = "# <<< ai-bridge <<<"
+SKIP_PREFIX = (
+    "<task-notification>", "<system-reminder>", "[Request interrupted",
+    "<artifact-content", "<local-command", "<command-name>", "<command-message>",
+    "<command-args>", "<bash-input>", "<bash-stdout>", "<bash-stderr>", "Caveat:",
+    "This session is being continued", "<ide_opened_file>", "<ide_selection>",
+)
+
+
+class BridgeError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- projects
+
+def project_key(path):
+    """Claude Code's folder name under ~/.claude/projects for a path."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
+
+
+def find_project_dir(key):
+    exact = CLAUDE_PROJECTS / key
+    if exact.is_dir() or len(key) <= 140:
+        return exact
+    # Claude shortens very long names; match on the kept prefix.
+    matches = sorted(CLAUDE_PROJECTS.glob(key[:140] + "*"))
+    return matches[0] if matches else exact
+
+
+def git(cwd, *args):
+    try:
+        out = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True,
+                             text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def project_root(cwd):
+    """The folder Claude keys auto memory on: the main repo root (shared by
+    worktrees and subfolders), or the folder itself outside git."""
+    common = git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common and Path(common).name == ".git":
+        return Path(common).parent
+    top = git(cwd, "rev-parse", "--show-toplevel")
+    return Path(top) if top else Path(cwd)
+
+
+def worktree_root(cwd):
+    """The checkout Codex treats as the project (where .codex/ lives)."""
+    top = git(cwd, "rev-parse", "--show-toplevel")
+    return Path(top) if top else Path(cwd)
+
+
+def memory_dir(root):
+    return find_project_dir(project_key(root)) / "memory"
+
+
+def ago(ts):
+    secs = max(0, time.time() - ts)
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        if secs >= size:
+            n = int(secs // size)
+            return "%d %s%s ago" % (n, unit, "" if n == 1 else "s")
+    return "just now"
+
+
+# ---------------------------------------------------------------- memory files
+
+def frontmatter(text):
+    if not text.startswith("---\n"):
+        return None
+    end = text.find("\n---", 4)
+    if end < 0:
+        return None
+    block = text[4:end]
+
+    def field(pattern):
+        m = re.search(pattern, block, re.M)
+        return m.group(1).strip().strip("'\"") if m else ""
+
+    return {
+        "name": field(r"^name:\s*(.+)$"),
+        "description": field(r"^description:\s*(.+)$"),
+        "type": field(r"^\s+type:\s*(\S+)") or field(r"^type:\s*(\S+)"),
+    }
+
+
+def index_title(name):
+    words = name.replace("_", "-").split("-")
+    text = " ".join(w for w in words if w)
+    return text[:1].upper() + text[1:]
+
+
+def read_index(mem):
+    path = mem / "MEMORY.md"
+    if not path.is_file():
+        return ""
+    data = path.read_bytes()[:INDEX_MAX_BYTES].decode("utf-8", "ignore")
+    return "\n".join(data.splitlines()[:INDEX_MAX_LINES]).strip()
+
+
+def pending(key):
+    folder = INBOX / key
+    if not folder.is_dir():
+        return []
+    out = []
+    for f in sorted(folder.glob("*.md")):
+        meta = frontmatter(f.read_text(errors="ignore")) or {}
+        out.append((f, meta))
+    return out
+
+
+def add_source(text):
+    if re.search(r"^\s+source:\s*codex\s*$", text, re.M):
+        return text
+    if re.search(r"^metadata:\s*$", text, re.M):
+        return re.sub(r"^metadata:\s*$", "metadata:\n  source: codex", text, count=1, flags=re.M)
+    return text
+
+
+def update_index(mem, fname, line):
+    path = mem / "MEMORY.md"
+    lines = path.read_text().splitlines() if path.is_file() else ["# Memory index", ""]
+    link = "](" + fname + ")"
+    for i, existing in enumerate(lines):
+        if link in existing:
+            lines[i] = line
+            break
+    else:
+        lines.append(line)
+    path.write_text("\n".join(lines).rstrip("\n") + "\n")
+
+
+def pull(keys, dry_run, quiet=False):
+    """Copy inbox memories into Claude's memory. Returns the index lines pulled."""
+    say = (lambda *a: None) if quiet else print
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    pulled = []
+    for key in keys:
+        items = pending(key)
+        if not items:
+            continue
+        mem = find_project_dir(key) / "memory"
+        say(("Would pull into " if dry_run else "Pulling into ") + str(mem))
+        for src, meta in items:
+            if src.name == "MEMORY.md" or not SAFE_NAME.match(src.name):
+                say("  skip    %s (not a memory file name)" % src.name)
+                continue
+            if not meta or not meta["name"] or not meta["description"]:
+                say("  skip    %s (needs name and description frontmatter)" % src.name)
+                continue
+            text = add_source(src.read_text())
+            dest = mem / src.name
+            if not dest.exists():
+                action = "new"
+            elif dest.read_text() == text:
+                action = "same"
+            else:
+                action = "update"
+            say("  %-7s %s — %s" % (action, src.name, meta["description"]))
+            if dry_run:
+                continue
+            mem.mkdir(parents=True, exist_ok=True)
+            if action == "update":
+                backup = HOME / ".claude" / "backups" / ("mem-pull-" + stamp) / key
+                backup.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(dest, backup / dest.name)
+            if action != "same":
+                dest.write_text(text)
+            line = "- [%s](%s) — %s" % (index_title(meta["name"]), src.name, meta["description"])
+            update_index(mem, src.name, line)
+            done = INBOX / key / ".pulled"
+            done.mkdir(exist_ok=True)
+            src.rename(done / (stamp + "-" + src.name))
+            pulled.append(line)
+    if not dry_run:
+        say("Pulled %d memor%s into Claude." % (len(pulled), "y" if len(pulled) == 1 else "ies"))
+    return pulled
+
+
+# ---------------------------------------------------------------- Claude sessions
+
+def claude_sessions(cwd):
+    """This folder's Claude transcripts, newest first."""
+    dirs = dict.fromkeys([find_project_dir(project_key(cwd)),
+                          find_project_dir(project_key(project_root(cwd)))])
+    files = [f for d in dirs if d.is_dir() for f in d.glob("*.jsonl")]
+    return sorted(files, key=lambda f: f.stat().st_mtime, reverse=True)
+
+
+def claude_title(path):
+    """(title, has_conversation) from the end of a transcript."""
+    size = path.stat().st_size
+    with open(path, "rb") as fh:
+        fh.seek(max(0, size - 512_000))
+        tail = fh.read().decode("utf-8", "ignore")
+    ai = custom = None
+    talked = '"type":"assistant"' in tail
+    for line in tail.splitlines():
+        if '"ai-title"' not in line and '"custom-title"' not in line:
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        if o.get("type") == "ai-title":
+            ai = o.get("aiTitle") or ai
+        elif o.get("type") == "custom-title":
+            custom = o.get("customTitle") or custom
+    return custom or ai, talked or bool(custom or ai)
+
+
+def latest_claude_session(cwd):
+    for path in claude_sessions(cwd)[:8]:
+        title, talked = claude_title(path)
+        if talked:
+            return path, title
+    return None, None
+
+
+def find_claude_session(arg, cwd):
+    if arg:
+        if arg.endswith(".jsonl"):
+            path = Path(arg).expanduser().resolve()
+            if path.is_file():
+                return path
+            raise BridgeError("no such file: %s" % path)
+        hits = list(CLAUDE_PROJECTS.glob("*/%s.jsonl" % arg))
+        if not hits:
+            raise BridgeError("no Claude session with id %s" % arg)
+        return hits[0]
+    path, _ = latest_claude_session(cwd)
+    if not path:
+        raise BridgeError("no Claude session found for %s" % cwd)
+    return path
+
+
+def session_cwd(path):
+    with open(path, errors="ignore") as fh:
+        for i, line in enumerate(fh):
+            if i > 200:
+                break
+            try:
+                cwd = json.loads(line).get("cwd")
+            except ValueError:
+                continue
+            if cwd:
+                return Path(cwd)
+    return None
+
+
+def claude_text(content):
+    if isinstance(content, str):
+        return content
+    return "\n".join(b.get("text", "") for b in content or []
+                     if isinstance(b, dict) and b.get("type") == "text")
+
+
+def tool_brief(block):
+    args = block.get("input") or {}
+    for key in ("command", "file_path", "path", "pattern", "url", "query", "description"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            return "%s: %s" % (block.get("name"), " ".join(value.split())[:200])
+    return block.get("name") or "a tool"
+
+
+def render_claude(path):
+    entries = []
+    with open(path, errors="ignore") as fh:
+        for line in fh:
+            if '"type":"user"' not in line and '"type":"assistant"' not in line:
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if o.get("isSidechain") or o.get("isMeta"):
+                continue
+            msg = o.get("message") or {}
+            content = msg.get("content")
+            if o.get("type") == "user":
+                if isinstance(content, list) and any(
+                        isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+                    continue
+                text = claude_text(content).strip()
+                if text and not text.startswith(SKIP_PREFIX):
+                    entries.append("**You:** " + text)
+            elif o.get("type") == "assistant" and isinstance(content, list):
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "text" and b.get("text", "").strip():
+                        entries.append("**Claude:** " + b["text"].strip())
+                    elif b.get("type") == "tool_use":
+                        entries.append("- used " + tool_brief(b))
+    kept, size = [], 0
+    for entry in reversed(entries):
+        if size + len(entry) > HANDOFF_MAX_CHARS and kept:
+            break
+        kept.append(entry)
+        size += len(entry)
+    return list(reversed(kept)), len(kept) < len(entries)
+
+
+def cmd_claude_transcript(args):
+    cwd = Path.cwd().resolve()
+    path = find_claude_session(args[0] if args else None, cwd)
+    title, _ = claude_title(path)
+    blocks, more = render_claude(path)
+    header = ["# Claude Code session", "",
+              "- Session: %s (`%s`)" % (title or "untitled", path.stem),
+              "- Folder: %s" % (session_cwd(path) or "?"),
+              "- Last active: %s" % datetime.datetime.fromtimestamp(
+                  path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")]
+    if more:
+        header.append("- Earlier turns are left out; the full transcript: %s" % path)
+    sys.stdout.write("\n".join(header) + "\n\n---\n\n" + "\n\n".join(blocks) + "\n")
+    return 0
+
+
+# ---------------------------------------------------------------- codex app-server
+
+class AppServer:
+    """Minimal JSON-RPC client for `codex app-server` over stdio."""
+
+    def __init__(self, cwd, timeout=60):
+        try:
+            self.proc = subprocess.Popen(["codex", "app-server"], cwd=str(cwd),
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL)
+        except OSError:
+            raise BridgeError("codex is not installed (npm install -g @openai/codex)")
+        self.fd = self.proc.stdout.fileno()
+        self.buf = b""
+        self.next_id = 0
+        self.notes = []
+        self.request("initialize", {
+            "clientInfo": {"name": "ai-bridge", "title": "ai-bridge", "version": VERSION},
+            "capabilities": {"experimentalApi": False}}, timeout=timeout)
+        self.send({"method": "initialized", "params": {}})
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+    def send(self, msg):
+        self.proc.stdin.write((json.dumps(msg) + "\n").encode())
+        self.proc.stdin.flush()
+
+    def read(self, deadline):
+        while True:
+            while b"\n" not in self.buf:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise BridgeError("timed out waiting for codex app-server")
+                ready, _, _ = select.select([self.fd], [], [], remaining)
+                if not ready:
+                    continue
+                chunk = os.read(self.fd, 65536)
+                if not chunk:
+                    raise BridgeError("codex app-server exited unexpectedly")
+                self.buf += chunk
+            line, self.buf = self.buf.split(b"\n", 1)
+            if line.strip():
+                return json.loads(line)
+
+    def handle(self, msg):
+        if "id" in msg and "method" in msg:  # a request from the server; we take none
+            self.send({"id": msg["id"],
+                       "error": {"code": -32601, "message": "unsupported: " + msg["method"]}})
+        elif "method" in msg:
+            self.notes.append(msg)
+
+    def request(self, method, params, timeout=60):
+        self.next_id += 1
+        rid = self.next_id
+        self.send({"id": rid, "method": method, "params": params})
+        deadline = time.monotonic() + timeout
+        while True:
+            msg = self.read(deadline)
+            if msg.get("id") == rid and "method" not in msg:
+                if "error" in msg:
+                    raise BridgeError("codex %s failed: %s" % (
+                        method, msg["error"].get("message", msg["error"])))
+                return msg.get("result") or {}
+            self.handle(msg)
+
+    def wait_for(self, method, timeout):
+        deadline = time.monotonic() + timeout
+        while True:
+            for note in self.notes:
+                if note.get("method") == method:
+                    self.notes.remove(note)
+                    return note.get("params") or {}
+            self.handle(self.read(deadline))
+
+
+# ---------------------------------------------------------------- Codex sessions
+
+def item_lines(item):
+    kind = item.get("type")
+    if kind == "userMessage":
+        text = "\n".join(c.get("text", "") for c in item.get("content") or []
+                         if c.get("type") == "text").strip()
+        return ["**You:** " + text] if text else []
+    if kind == "agentMessage" and item.get("text"):
+        return ["**Codex:** " + item["text"].strip()]
+    if kind == "plan" and item.get("text"):
+        return ["**Plan:**\n" + item["text"].strip()]
+    if kind == "commandExecution":
+        actions = item.get("commandActions") or []
+        cmd = (actions[0].get("command") if actions else None) or item.get("command") or ""
+        code = item.get("exitCode")
+        tail = " (exit %s)" % code if code not in (0, None) else ""
+        return ["- ran `%s`%s" % (" ".join(cmd.split())[:300], tail)]
+    if kind == "fileChange":
+        paths = [c.get("path") for c in item.get("changes") or [] if c.get("path")]
+        return ["- changed " + ", ".join(paths)] if paths else []
+    if kind == "mcpToolCall":
+        return ["- used %s.%s" % (item.get("server"), item.get("tool"))]
+    if kind == "webSearch" and item.get("query"):
+        return ["- searched the web: " + item["query"]]
+    if kind == "contextCompaction":
+        return ["- (context was compacted here)"]
+    return []  # hookPrompt (our memory block), reasoning, tool plumbing
+
+
+def render_turns(srv, thread_id):
+    blocks, size, cursor, more = [], 0, None, False
+    while True:
+        params = {"threadId": thread_id, "limit": 25, "itemsView": "full",
+                  "sortDirection": "desc"}
+        if cursor:
+            params["cursor"] = cursor
+        page = srv.request("thread/turns/list", params)
+        for turn in page.get("data") or []:
+            lines = [l for item in turn.get("items") or [] for l in item_lines(item)]
+            if not lines:
+                continue
+            block = "\n\n".join(lines)
+            if size + len(block) > HANDOFF_MAX_CHARS and blocks:
+                more = True
+                break
+            blocks.append(block)
+            size += len(block)
+        cursor = page.get("nextCursor")
+        if more or not cursor:
+            more = more or bool(cursor)
+            break
+    blocks.reverse()
+    return blocks, more
+
+
+def find_codex_thread(srv, cwd, thread_id=None):
+    if thread_id:
+        return srv.request("thread/read", {"threadId": thread_id}).get("thread")
+    for folder in dict.fromkeys([str(cwd), str(project_root(cwd))]):
+        found = srv.request("thread/list", {
+            "limit": 1, "cwd": [folder], "sortKey": "updated_at",
+            "sortDirection": "desc"}, timeout=10).get("data") or []
+        if found:
+            return found[0]
+    return None
+
+
+def thread_title(thread):
+    if thread.get("name"):
+        return thread["name"]
+    lines = (thread.get("preview") or "").strip().splitlines()
+    return lines[0][:80] if lines else "untitled"
+
+
+def codex_transcript(cwd, thread_id=None):
+    """(markdown, thread, folder) for this folder's latest Codex session."""
+    with AppServer(cwd) as srv:
+        thread = find_codex_thread(srv, cwd, thread_id)
+        if not thread:
+            raise BridgeError("no Codex session found for %s" % cwd)
+        blocks, more = render_turns(srv, thread["id"])
+    work = Path(thread.get("cwd") or cwd)
+    if not work.is_dir():
+        work = cwd
+    when = datetime.datetime.fromtimestamp(thread.get("updatedAt") or time.time())
+    header = ["# Codex session", "",
+              "- Session: %s (`%s`)" % (thread_title(thread), thread["id"]),
+              "- Folder: %s" % work,
+              "- Model: %s %s" % (thread.get("model") or "?", thread.get("reasoningEffort") or ""),
+              "- Last active: %s" % when.strftime("%Y-%m-%d %H:%M")]
+    if more:
+        header.append("- Earlier turns are left out; the full session: `codex resume %s`"
+                      % thread["id"])
+    text = "\n".join(header) + "\n\n---\n\n" + "\n\n---\n\n".join(blocks) + "\n"
+    return text, thread, work
+
+
+def cmd_codex_transcript(args):
+    text, _, _ = codex_transcript(Path.cwd().resolve(), args[0] if args else None)
+    sys.stdout.write(text)
+    return 0
+
+
+# ---------------------------------------------------------------- MCP servers
+
+VAR_ONLY = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+
+def toml_key(key):
+    return key if re.match(r"^[A-Za-z0-9_-]+$", key) else json.dumps(key, ensure_ascii=False)
+
+
+def toml_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{ " + ", ".join("%s = %s" % (toml_key(k), toml_value(v))
+                                for k, v in value.items()) + " }"
+    raise ValueError("can't write %r as TOML" % (value,))
+
+
+def codex_server(cfg, cwd=None):
+    """Claude MCP config -> (Codex config, None) or (None, why it can't be shared)."""
+    kind = cfg.get("type") or ("http" if cfg.get("url") else "stdio")
+    if kind == "sse":
+        return None, "SSE servers don't work in Codex"
+    if kind == "stdio":
+        command = cfg.get("command")
+        args = [str(a) for a in cfg.get("args") or []]
+        env = {k: str(v) for k, v in (cfg.get("env") or {}).items()}
+        if not command:
+            return None, "no command"
+        if "${" in command or any("${" in s for s in args + list(env.values())):
+            return None, "uses ${VAR}, which Codex doesn't expand"
+        out = {"command": command}
+        if args:
+            out["args"] = args
+        if env:
+            out["env"] = env
+        if cwd:
+            out["cwd"] = str(cwd)
+        return out, None
+    if kind == "http":
+        url = cfg.get("url") or ""
+        if not url or "${" in url:
+            return None, "no usable url"
+        out = {"url": url}
+        headers, env_headers = {}, {}
+        for name, value in (cfg.get("headers") or {}).items():
+            value = str(value)
+            bearer = re.match(r"^Bearer \$\{([A-Za-z_][A-Za-z0-9_]*)\}$", value)
+            if bearer and name.lower() == "authorization":
+                out["bearer_token_env_var"] = bearer.group(1)
+            elif VAR_ONLY.match(value):
+                env_headers[name] = VAR_ONLY.match(value).group(1)
+            elif "${" in value:
+                return None, "header %s uses ${VAR}, which Codex doesn't expand" % name
+            else:
+                headers[name] = value
+        if headers:
+            out["http_headers"] = headers
+        if env_headers:
+            out["env_http_headers"] = env_headers
+        return out, None
+    return None, "unknown server type %s" % kind
+
+
+def claude_mcp(cwd):
+    """(user servers, project servers, project folder) as Claude sees them from cwd."""
+    try:
+        data = json.loads(CLAUDE_JSON.read_text())
+    except (OSError, ValueError):
+        data = {}
+    top = worktree_root(cwd)
+    projects = data.get("projects") or {}
+    places = list(dict.fromkeys([str(top), str(cwd)]))
+    disabled = set()
+    for place in places:
+        disabled.update((projects.get(place) or {}).get("disabledMcpjsonServers") or [])
+    project = {}
+    for place in places:  # .mcp.json (project scope)
+        try:
+            servers = json.loads((Path(place) / ".mcp.json").read_text()).get("mcpServers") or {}
+        except (OSError, ValueError, AttributeError):
+            continue
+        project.update({k: v for k, v in servers.items() if k not in disabled})
+    for place in places:  # `claude mcp add` without --scope (local scope)
+        project.update((projects.get(place) or {}).get("mcpServers") or {})
+    return data.get("mcpServers") or {}, project, top
+
+
+def write_mcp_block(path, servers, notes):
+    """Rewrite our marked block in a Codex config.toml. Returns True if changed."""
+    import tomllib
+    text = path.read_text() if path.exists() else ""
+    start, end = text.find(MCP_BEGIN), text.find(MCP_END)
+    if start >= 0 and end > start:
+        rest = text[end + len(MCP_END):].lstrip("\n")
+        base = text[:start].rstrip("\n") + ("\n\n" + rest if rest else "\n")
+    else:
+        base = text
+    taken = set((tomllib.loads(base).get("mcp_servers") or {}).keys())
+    lines = []
+    for name, cfg in servers.items():
+        if name in taken:
+            notes.append("%s: %s already defines it, left as is" % (name, path))
+            continue
+        lines.append("[mcp_servers.%s]" % toml_key(name))
+        lines += ["%s = %s" % (toml_key(k), toml_value(v)) for k, v in cfg.items()]
+        lines.append("")
+    if lines:
+        block = "\n".join([MCP_BEGIN] + lines + [MCP_END]) + "\n"
+        new = (base.rstrip("\n") + "\n\n" if base.strip() else "") + block
+    else:
+        new = base if base.strip() else ""
+    if new == text:
+        return False
+    tomllib.loads(new)  # never leave Codex a config it can't read
+    if not new:
+        path.unlink()
+        return True
+    tmp = path.with_name(path.name + ".ai-bridge-tmp")
+    tmp.write_text(new)
+    if path.exists():
+        shutil.copymode(path, tmp)
+    else:
+        os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    return True
+
+
+def git_exclude(top, pattern):
+    if git(top, "check-ignore", "-q", pattern.lstrip("/")) is not None:
+        return
+    exclude = git(top, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude")
+    if not exclude:
+        return
+    path = Path(exclude)
+    current = path.read_text() if path.exists() else ""
+    if pattern in current.split("\n"):
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as fh:
+        fh.write(("" if current.endswith("\n") or not current else "\n")
+                 + "# ai-bridge: Codex config made from Claude's .mcp.json\n" + pattern + "\n")
+
+
+def sync_mcp(cwd):
+    """Copy Claude's MCP servers into Codex. Returns (changed files, notes)."""
+    user, project, top = claude_mcp(cwd)
+    changed, notes = [], []
+
+    def convert(servers, where):
+        out = {}
+        for name, cfg in servers.items():
+            conv, why = codex_server(cfg, where)
+            if conv:
+                out[name] = conv
+            else:
+                notes.append("%s: not shared (%s)" % (name, why))
+        return out
+
+    global_cfg = CODEX_HOME / "config.toml"
+    local_cfg = top / ".codex" / "config.toml"
+    servers = convert(project, top)
+    same = local_cfg.resolve() == global_cfg.resolve()  # in ~, .codex is Codex's home
+    if write_mcp_block(global_cfg, dict(convert(user, None), **servers) if same
+                       else convert(user, None), notes):
+        changed.append(global_cfg)
+
+    if not same and (servers or local_cfg.exists()):
+        if git(top, "ls-files", "--error-unmatch", ".codex/config.toml") is not None:
+            notes.append("%s is tracked in git; not touching it" % local_cfg)
+        else:
+            if servers:
+                local_cfg.parent.mkdir(exist_ok=True)
+                git_exclude(top, "/.codex/config.toml")
+            if write_mcp_block(local_cfg, servers, notes):
+                changed.append(local_cfg)
+            if not local_cfg.exists() and local_cfg.parent.is_dir() \
+                    and not any(local_cfg.parent.iterdir()):
+                local_cfg.parent.rmdir()
+    return changed, notes
+
+
+def cmd_sync(args):
+    quiet = "--quiet" in args or "-q" in args
+    changed, notes = sync_mcp(Path.cwd().resolve())
+    if not quiet:
+        user, project, _ = claude_mcp(Path.cwd().resolve())
+        print("Claude MCP servers: %s" % (", ".join(user) or "none"))
+        if project:
+            print("This project's servers: %s" % ", ".join(project))
+        for path in changed:
+            print("updated %s" % path)
+        for note in notes:
+            print("note    %s" % note)
+        if not changed:
+            print("Codex already has them.")
+    return 0
+
+
+# ---------------------------------------------------------------- hooks
+
+def codex_context(cwd):
+    root = project_root(cwd)
+    key = project_key(root)
+    mem = memory_dir(root)
+    inbox = INBOX / key
+    inbox.mkdir(parents=True, exist_ok=True)
+
+    parts = ["# Shared memory with Claude Code",
+             "The user also works with Claude Code in this folder, and you two share "
+             "long-term memory. Use it the way Claude does: as background that may be "
+             "out of date, so check a memory against the current state before acting on it."]
+
+    global_md = HOME / ".claude" / "CLAUDE.md"
+    if global_md.is_file():
+        parts += ["## The user's global instructions (~/.claude/CLAUDE.md)",
+                  global_md.read_text(errors="ignore").strip()]
+
+    index = read_index(mem)
+    parts.append("## Claude's memories for this project")
+    if index:
+        parts += ["Folder: %s/ (read-only for you: never edit or delete files there)." % mem,
+                  "Each line below points to a topic file in that folder. Read the file "
+                  "(cat it) when it is relevant, before relying on it.",
+                  index]
+    else:
+        parts.append("Claude has no memories for this project yet.")
+
+    mine = pending(key)
+    if mine:
+        parts.append("## Memories you saved earlier (Claude gets them next time it starts here)")
+        parts += ["- %s — %s" % (f.name, m.get("description", "")) for f, m in mine]
+
+    path, title = latest_claude_session(cwd)
+    if path and time.time() - path.stat().st_mtime < RECENT_DAYS * 86400:
+        parts += ["## The user's latest Claude Code session here",
+                  "\"%s\", last active %s. If the user wants to continue it, or asks what "
+                  "Claude did, read it with: %s claude-transcript %s"
+                  % (title or "untitled", ago(path.stat().st_mtime), SCRIPT, path.stem)]
+
+    parts += [
+        "## Saving memories",
+        "When you learn something worth keeping for future sessions, save it without "
+        "being asked, and say so in one line. Write one file per memory to "
+        "%s/<short-kebab-name>.md in exactly this format:" % inbox,
+        "---\nname: <short-kebab-name>\ndescription: <one line, used later to decide "
+        "relevance>\nmetadata:\n  type: user | feedback | project | reference\n---\n\n"
+        "<the fact. For feedback and project memories, follow it with **Why:** and "
+        "**How to apply:** lines.>",
+        "Types: user = who the user is and how they like to work; feedback = corrections "
+        "and approaches they confirmed, with the reason; project = ongoing work, "
+        "decisions and deadlines the code and git history don't show (write absolute "
+        "dates); reference = where to find things outside the project. Don't save what "
+        "the code, git history, AGENTS.md or CLAUDE.md already say, or anything only "
+        "useful in this conversation. Never save secrets, tokens or passwords.",
+        "To correct or extend one of Claude's memories, write the full new version to "
+        "the inbox under the same file name. Before creating a memory, check the lists "
+        "above so you update an existing one instead of duplicating it.",
+        "Claude copies the inbox into its memory folder when it next starts here. Do "
+        "not write to Claude's memory folder yourself.",
+    ]
+    return "\n\n".join(parts) + "\n"
+
+
+def hook_payload():
+    try:
+        return json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return {}
+
+
+def cmd_codex_hook():
+    cwd = Path(hook_payload().get("cwd") or os.getcwd())
+    try:
+        sync_mcp(cwd)  # takes effect from Codex's next start
+    except Exception as exc:
+        sys.stderr.write("ai-bridge mcp sync: %s\n" % exc)
+    try:
+        sys.stdout.write(codex_context(cwd))
+    except Exception as exc:  # never block Codex from starting
+        sys.stderr.write("ai-bridge hook: %s\n" % exc)
+    return 0
+
+
+def cmd_claude_hook():
+    cwd = Path(hook_payload().get("cwd") or os.getcwd())
+    parts = []
+    try:
+        pulled = pull([project_key(project_root(cwd))], dry_run=False, quiet=True)
+        if pulled:
+            parts.append("Codex (GPT), which the user also uses here, saved these memories "
+                         "since your last session. They are now in your memory folder:\n"
+                         + "\n".join(pulled))
+    except Exception as exc:
+        sys.stderr.write("ai-bridge pull: %s\n" % exc)
+    try:
+        sync_mcp(cwd)
+    except Exception as exc:
+        sys.stderr.write("ai-bridge mcp sync: %s\n" % exc)
+    try:
+        with AppServer(cwd, timeout=5) as srv:
+            thread = find_codex_thread(srv, cwd)
+        if thread and time.time() - (thread.get("updatedAt") or 0) < RECENT_DAYS * 86400:
+            parts.append("The user also works with Codex (GPT) in this folder. Their latest "
+                         "Codex session: \"%s\", last active %s. If the user wants to "
+                         "continue it, or asks what Codex did, read it with: %s "
+                         "codex-transcript %s"
+                         % (thread_title(thread), ago(thread["updatedAt"]), SCRIPT,
+                            thread["id"]))
+    except Exception:
+        pass  # Codex missing or slow: nothing to report
+    if parts:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                                 "additionalContext": "\n\n".join(parts)}}))
+    return 0
+
+
+# ---------------------------------------------------------------- to-codex / to-claude
+
+def imported_thread(source):
+    ledger = CODEX_HOME / "external_agent_session_imports.json"
+    try:
+        records = json.loads(ledger.read_text()).get("records") or []
+    except (OSError, ValueError):
+        return None
+    ids = [r.get("imported_thread_id") for r in records
+           if r.get("source_path") == str(source) and r.get("imported_thread_id")]
+    return ids[-1] if ids else None
+
+
+def claude_size(path):
+    """(estimated tokens of a Claude conversation, Claude's latest compaction summary)."""
+    chars, summary = 0, None
+    with open(path, errors="ignore") as fh:
+        for line in fh:
+            if '"type":"user"' not in line and '"type":"assistant"' not in line:
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if o.get("type") not in ("user", "assistant") or o.get("isSidechain"):
+                continue
+            content = (o.get("message") or {}).get("content")
+            if o.get("isCompactSummary"):
+                summary = claude_text(content)
+            blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content or []
+            for b in blocks:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text":
+                    chars += len(b.get("text") or "")
+                elif b.get("type") == "tool_use":
+                    chars += len(json.dumps(b.get("input")))
+                elif b.get("type") == "tool_result":
+                    body = b.get("content")
+                    chars += len(body if isinstance(body, str) else json.dumps(body))
+    return chars // 4, summary
+
+
+def claude_handoff(source, summary):
+    """Claude's summary of the earlier work plus the recent part, for Codex to read. -> path."""
+    title, _ = claude_title(source)
+    blocks, more = render_claude(source)
+    head = ["# Claude Code session", "",
+            "- Session: %s (`%s`)" % (title or "untitled", source.stem),
+            "- Folder: %s" % (session_cwd(source) or "?"),
+            "- The whole transcript: %s" % source]
+    parts = ["\n".join(head)]
+    if summary:
+        parts.append("## Claude's summary of the earlier work\n\n" + summary.strip())
+    parts.append("## The most recent part" + (" (earlier turns left out)" if more else "")
+                 + "\n\n" + "\n\n".join(blocks))
+    HANDOFFS.mkdir(parents=True, exist_ok=True)
+    out = HANDOFFS / ("%s-%s.md" % (datetime.datetime.now().strftime("%Y%m%d-%H%M"), source.stem))
+    out.write_text("\n\n---\n\n".join(parts) + "\n")
+    return out
+
+
+def cmd_to_codex(args):
+    show = "--print" in args
+    rest = [a for a in args if a != "--print"]
+    cwd = Path.cwd().resolve()
+    source = find_claude_session(rest[0] if rest else None, cwd).resolve()
+    work = session_cwd(source) or cwd
+    if not work.is_dir():
+        work = cwd
+    tokens, summary = claude_size(source)
+    if tokens > IMPORT_MAX_TOKENS:
+        # Codex reads ~272k tokens; a bigger import can't even be compacted, so every turn fails
+        out = claude_handoff(source, summary)
+        print("This conversation is ~%dk tokens, more than Codex can take whole, so Codex starts "
+              "fresh on Claude's summary plus the recent part (%s)." % (tokens // 1000, out))
+        prompt = ("I'm switching to you from a Claude Code session in this folder. It is too long to "
+                  "import whole, so here is Claude's summary of the earlier work plus the most recent "
+                  "part: %s. Read it, then tell me in a few lines where that session left off and "
+                  "what is still open. Don't start new work until I say so." % out)
+        return launch(["codex", "-p", ASTRA_PROFILE, prompt], work, show)
+    print("Importing Claude session %s (~%dk tokens) into Codex..." % (source.stem, tokens // 1000))
+    with AppServer(work) as srv:
+        srv.request("externalAgentConfig/import", {"migrationItems": [{
+            "itemType": "SESSIONS",
+            "description": "Transfer Claude session " + source.name,
+            "cwd": None,
+            "details": {"plugins": [], "sessions": [{"path": str(source), "cwd": str(work),
+                                                     "title": None}],
+                        "mcpServers": [], "hooks": [], "subagents": [], "commands": []}}]})
+        done = srv.wait_for("externalAgentConfig/import/completed", timeout=120)
+    for result in done.get("itemTypeResults") or []:
+        for failure in result.get("failures") or []:
+            raise BridgeError("Codex could not import the session: %s" % failure.get("message"))
+    thread = imported_thread(source)
+    if not thread:
+        raise BridgeError("Codex found nothing to import in %s (a session with no "
+                          "messages yet?)" % source.name)
+    return launch(["codex", "resume", "-p", ASTRA_PROFILE, thread], work, show)
+
+
+def cmd_to_claude(args):
+    show = "--print" in args
+    no_pull = "--no-pull" in args
+    rest = [a for a in args if a not in ("--print", "--no-pull")]
+    cwd = Path.cwd().resolve()
+    text, thread, work = codex_transcript(cwd, rest[0] if rest else None)
+    when = datetime.datetime.fromtimestamp(thread.get("updatedAt") or time.time())
+    HANDOFFS.mkdir(parents=True, exist_ok=True)
+    out = HANDOFFS / ("%s-%s.md" % (when.strftime("%Y%m%d-%H%M"), thread["id"]))
+    out.write_text(text)
+    print("Saved the Codex transcript to %s" % out)
+
+    key = project_key(project_root(work))
+    if not no_pull and pending(key):
+        pull([key], dry_run=show)
+
+    prompt = ("I'm switching to you from a Codex (GPT) session in this folder. Its "
+              "transcript is at %s. Read it, then tell me in a few lines where that "
+              "session left off and what is still open. Don't start new work until I "
+              "say so." % out)
+    return launch(["claude", "--add-dir", str(HANDOFFS), prompt], work, show)
+
+
+def launch(cmd, cwd, show):
+    if show:
+        print("cd %s && %s" % (shell_quote(str(cwd)), " ".join(shell_quote(c) for c in cmd)))
+        return 0
+    os.chdir(str(cwd))
+    os.execvp(cmd[0], cmd)
+
+
+def shell_quote(s):
+    return s if re.match(r"^[A-Za-z0-9_./:=@%+-]+$", s) else "'" + s.replace("'", "'\\''") + "'"
+
+
+# ---------------------------------------------------------------- mem
+
+def cmd_mem(args):
+    sub = args[0] if args else "status"
+    cwd = Path.cwd().resolve()
+    root = project_root(cwd)
+    key = project_key(root)
+    if sub in ("status", "st"):
+        mem = memory_dir(root)
+        topics = [f for f in mem.glob("*.md") if f.name != "MEMORY.md"] if mem.is_dir() else []
+        print("Project  %s" % root)
+        print("Claude   %d memor%s  %s" % (len(topics), "y" if len(topics) == 1 else "ies",
+                                          mem if mem.is_dir() else "(none yet)"))
+        items = pending(key)
+        if items:
+            print("Codex    %d new; Claude gets them when it next starts here (or `mem pull`):"
+                  % len(items))
+            for f, meta in items:
+                print("           %s — %s" % (f.name, meta.get("description")
+                                              or "(invalid: needs name and description)"))
+        else:
+            print("Codex    nothing new")
+        others = [d.name for d in INBOX.iterdir()
+                  if d.is_dir() and d.name != key and pending(d.name)] if INBOX.is_dir() else []
+        if others:
+            print("Other projects with new Codex memories: %d (`mem pull --all`)" % len(others))
+        return 0
+    if sub == "pull":
+        dry = "-n" in args or "--dry-run" in args
+        if "--all" in args:
+            keys = sorted(d.name for d in INBOX.iterdir() if d.is_dir()) if INBOX.is_dir() else []
+        else:
+            keys = [key]
+        if not any(pending(k) for k in keys):
+            print("No new Codex memories%s." % ("" if "--all" in args else " for " + str(root)))
+            return 0
+        pull(keys, dry)
+        return 0
+    if sub == "show":
+        sys.stdout.write(codex_context(cwd))
+        return 0
+    raise BridgeError("unknown mem command: %s (status, pull, show)" % sub)
+
+
+# ---------------------------------------------------------------- setup
+
+ZSH_WRAPPER = r'''# >>> ai-bridge >>>
+# `codex` starts the bridge's profile (~/.codex/astra.config.toml) and first copies
+# Claude's MCP servers into Codex. Pass -p/--profile or -m/--model to choose
+# something else. Remove this block to undo.
+export SESSIONS_CODEX_ARGS="-p astra"  # s (sessions picker) starts Codex with Astra too
+codex() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      -p|--profile|--profile=*|-m|--model|--model=*) command codex "$@"; return ;;
+    esac
+  done
+  case "${1:-}" in
+    agents|login|logout|mcp|plugin|app-server|remote-control|app|completion|update|doctor|\
+sandbox|debug|apply|a|queue|archive|delete|migrate-rollouts|unarchive|cloud|exec-server|\
+features|help|-h|--help|-V|--version)
+      command codex "$@" ;;
+    *)
+      command -v ai-bridge >/dev/null && ai-bridge sync --quiet 2>/dev/null
+      command codex -p astra "$@" ;;
+  esac
+}
+# <<< ai-bridge <<<
+'''
+
+
+def backup(path, stamp):
+    if path.exists():
+        shutil.copy2(path, path.with_name(path.name + ".bak-ai-bridge-" + stamp))
+
+
+def cmd_setup(args=()):
+    model = ASTRA_MODEL
+    if "--model" in args:
+        i = list(args).index("--model")
+        if i + 1 >= len(args):
+            raise BridgeError("--model needs a model name, e.g. --model gpt-6.1-sol")
+        model = args[i + 1]
+    try:
+        import tomllib
+    except ImportError:
+        raise BridgeError("setup needs Python 3.11+ (for tomllib)")
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    python = shutil.which("python3") or sys.executable
+
+    for name in ("cx", "mem", "to-codex", "to-claude"):
+        link = SCRIPT.parent / name
+        if link.is_symlink() and link.resolve() == SCRIPT:
+            continue
+        if link.exists() or link.is_symlink():
+            print("skip   %s exists and is not ours" % link)
+            continue
+        link.symlink_to(SCRIPT.name)
+        print("linked %s" % link)
+
+    CODEX_HOME.mkdir(exist_ok=True)
+    INBOX.mkdir(parents=True, exist_ok=True)
+    HANDOFFS.mkdir(parents=True, exist_ok=True)
+
+    profile = CODEX_HOME / (ASTRA_PROFILE + ".config.toml")
+    if not profile.exists() or "--model" in args:
+        profile.write_text('model = "%s"\nmodel_reasoning_effort = "high"\n' % model)
+        print("wrote  %s (model %s)" % (profile, model))
+
+    # Codex: SessionStart hook
+    hook_cmd = '"%s" "%s" codex-hook' % (python, SCRIPT)
+    hooks_path = CODEX_HOME / "hooks.json"
+    data = json.loads(hooks_path.read_text()) if hooks_path.exists() else {}
+    starts = data.setdefault("hooks", {}).setdefault("SessionStart", [])
+    ours = [h for group in starts for h in group.get("hooks", [])
+            if "ai-bridge" in h.get("command", "") and "codex-hook" in h.get("command", "")]
+    if ours:
+        for h in ours:
+            h["command"] = hook_cmd
+    else:
+        starts.append({"matcher": "startup|resume|clear|compact",
+                       "hooks": [{"type": "command", "command": hook_cmd, "timeout": 15,
+                                  "additionalContextLimit": 12000}]})
+    rendered = json.dumps(data, indent=2) + "\n"
+    if not hooks_path.exists() or hooks_path.read_text() != rendered:
+        hooks_path.write_text(rendered)
+        print("wrote  %s (Codex asks you to trust the changed hook once)" % hooks_path)
+
+    # Codex: config.toml
+    config = CODEX_HOME / "config.toml"
+    text = config.read_text() if config.exists() else ""
+    parsed = tomllib.loads(text)
+    new = text
+    if "project_doc_fallback_filenames" not in parsed:
+        first_table = re.search(r"^\[", new, re.M)
+        line = 'project_doc_fallback_filenames = ["CLAUDE.md"]\n'
+        new = (new[:first_table.start()] + line + "\n" + new[first_table.start():]
+               if first_table else line + new)
+    roots = parsed.get("sandbox_workspace_write", {}).get("writable_roots", [])
+    if "sandbox_workspace_write" not in parsed:
+        new = new.rstrip("\n") + '\n\n[sandbox_workspace_write]\nwritable_roots = ["%s"]\n' % SHARED
+    elif str(SHARED) not in roots:
+        print("note   add %s to writable_roots under [sandbox_workspace_write] in %s"
+              % (SHARED, config))
+    if new != text:
+        backup(config, stamp)
+        config.write_text(new)
+        print("edited %s (backup: config.toml.bak-ai-bridge-%s)" % (config, stamp))
+
+    # Claude: SessionStart hook in user settings
+    claude_cmd = '[ -f "%s" ] && "%s" "%s" claude-hook || true' % (SCRIPT, python, SCRIPT)
+    settings = json.loads(CLAUDE_SETTINGS.read_text()) if CLAUDE_SETTINGS.exists() else {}
+    starts = settings.setdefault("hooks", {}).setdefault("SessionStart", [])
+    ours = [h for group in starts for h in group.get("hooks", [])
+            if "ai-bridge" in h.get("command", "") and "claude-hook" in h.get("command", "")]
+    if ours:
+        changed = any(h["command"] != claude_cmd for h in ours)
+        for h in ours:
+            h["command"] = claude_cmd
+    else:
+        starts.append({"hooks": [{"type": "command", "command": claude_cmd, "timeout": 20}]})
+        changed = True
+    if changed:
+        backup(CLAUDE_SETTINGS, stamp)
+        CLAUDE_SETTINGS.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
+        print("edited %s (backup: settings.json.bak-ai-bridge-%s)" % (CLAUDE_SETTINGS, stamp))
+
+    # zsh: `codex` wrapper
+    zsh = ZSHRC.read_text() if ZSHRC.exists() else ""
+    start, end = zsh.find(ZSH_BEGIN), zsh.find(ZSH_END)
+    if start >= 0 and end > start:
+        new_zsh = zsh[:start] + ZSH_WRAPPER + zsh[end + len(ZSH_END):].lstrip("\n")
+    else:
+        new_zsh = zsh.rstrip("\n") + "\n\n" + ZSH_WRAPPER
+    if new_zsh != zsh:
+        backup(ZSHRC, stamp)
+        ZSHRC.write_text(new_zsh)
+        print("edited %s (open a new terminal, or run: source ~/.zshrc)" % ZSHRC)
+
+    changed, notes = sync_mcp(HOME)
+    for path in changed:
+        print("synced Claude's MCP servers into %s" % path)
+    for note in notes:
+        print("note   %s" % note)
+    print("\nDone.")
+    return 0
+
+
+def cmd_update():
+    """Replace this script with the latest release."""
+    import urllib.request
+    try:
+        data = urllib.request.urlopen(UPDATE_URL, timeout=20).read()
+    except Exception as exc:  # noqa: BLE001
+        raise BridgeError("download failed: %s" % exc)
+    compile(data, str(SCRIPT), "exec")  # refuse to install a broken script
+    m = re.search(rb'^VERSION = "([^"]+)"', data, re.M)
+    new = m.group(1).decode() if m else "?"
+    if new == VERSION:
+        print("ai-bridge %s is already the latest" % VERSION)
+        return 0
+    tmp = SCRIPT.with_name(SCRIPT.name + ".new")
+    tmp.write_bytes(data)
+    os.chmod(str(tmp), 0o755)
+    os.replace(str(tmp), str(SCRIPT))
+    print("ai-bridge updated %s -> %s" % (VERSION, new))
+    return 0
+
+
+# ---------------------------------------------------------------- main
+
+def main(argv):
+    prog = Path(argv[0]).name
+    args = argv[1:]
+    if prog == "ai-bridge":
+        if not args or args[0] in ("-h", "--help", "help"):
+            print(__doc__.strip())
+            return 0
+        if args[0] in ("-V", "--version"):
+            print("ai-bridge " + VERSION)
+            return 0
+        prog, args = args[0], args[1:]
+    if prog != "cx" and args[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    commands = {
+        "to-codex": cmd_to_codex,
+        "to-claude": cmd_to_claude,
+        "mem": cmd_mem,
+        "sync": cmd_sync,
+        "claude-transcript": cmd_claude_transcript,
+        "codex-transcript": cmd_codex_transcript,
+    }
+    if prog == "cx":
+        return launch(["codex", "-p", ASTRA_PROFILE] + args, Path.cwd(), False)
+    if prog in commands:
+        return commands[prog](args)
+    if prog == "codex-hook":
+        return cmd_codex_hook()
+    if prog == "claude-hook":
+        return cmd_claude_hook()
+    if prog == "setup":
+        return cmd_setup(args)
+    if prog == "update":
+        return cmd_update()
+    raise BridgeError("unknown command: %s (see ai-bridge --help)" % prog)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except BridgeError as exc:
+        sys.stderr.write("%s: %s\n" % (Path(sys.argv[0]).name, exc))
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)

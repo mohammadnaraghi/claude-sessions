@@ -26,12 +26,14 @@ Usage
   s jobs                 every in-session cron job and its status
   s path 3               print the session's directory  ->  cd "$(s path 3)"
   s -p                   print the list and exit (all rows when piped)
-  s update               replace this script with the latest release
+  s update               replace this script (and ai-bridge beside it) with the
+                         latest release
 
 Other machines (over ssh, key auth)
   s hosts                        list configured hosts and check them
   s hosts add studio user@host   add a host (label, then ssh destination)
-  s hosts setup studio           copy sessions to that host so it can answer
+  s hosts setup studio           copy sessions (and ai-bridge) to that host so it
+                                 can answer
   s hosts rm studio              remove a host
   Sessions from every host then appear in the list with a host column.
   Resuming one starts claude there inside a tmux session (when tmux is
@@ -76,6 +78,9 @@ Options
   SESSIONS_CODEX_ARGS    extra arguments for every codex it starts, e.g.
                          export SESSIONS_CODEX_ARGS="-p astra"
 
+Companion: ai-bridge (same repo) shares memory and MCP servers between Claude
+Code and Codex; see `ai-bridge --help`.
+
 Other machines answer within about a second; one that is slower is shown as of
 its last answer and refreshed in the background for next time.
 
@@ -101,7 +106,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/sessions/main/s"
 
 
@@ -1284,10 +1289,21 @@ def host_check(dest):
 def hosts_setup(label, dest):
     """Copy this script to the host so it can answer `s --json` and resume sessions."""
     me = os.path.realpath(__file__)
-    print(f"copying sessions {VERSION} to {label} ({dest}) ...")
+    bridge = os.path.join(os.path.dirname(me), "ai-bridge")
+    has_bridge = os.path.exists(bridge)
+    print(f"copying sessions {VERSION}{' and ai-bridge' if has_bridge else ''} to {label} ({dest}) ...")
     try:
         ssh(dest, "mkdir -p ~/.local/bin", timeout=20)
         subprocess.run(["scp", "-q", *SSH_OPTS, me, f"{dest}:.local/bin/s"], check=True, timeout=60)
+        if has_bridge:
+            subprocess.run(["scp", "-q", *SSH_OPTS, bridge, f"{dest}:.local/bin/ai-bridge"], check=True, timeout=60)
+            # refresh its hooks there when the bridge is already set up; never set it up unasked
+            p = ssh(dest, 'chmod +x ~/.local/bin/ai-bridge; export PATH="$HOME/.local/bin:/opt/homebrew/bin:'
+                          '/usr/local/bin:$PATH"; if grep -q ai-bridge ~/.codex/hooks.json 2>/dev/null; then '
+                          'ai-bridge setup >/dev/null && echo "ai-bridge: $(ai-bridge --version), setup refreshed"; '
+                          'else echo "ai-bridge: copied; run ai-bridge setup there to share memory with Codex"; fi',
+                    timeout=60)
+            print((p.stdout or "") + (p.stderr or ""), end="")
         # the same tool's old name there (cs) goes; anything else called cs is left alone
         p = ssh(dest, "chmod +x ~/.local/bin/s && ~/.local/bin/s --version && "
                       "(grep -q 'mohammadnaraghi/claude-sessions' ~/.local/bin/cs 2>/dev/null && "
@@ -2331,25 +2347,39 @@ def print_mode(hits):
         print(c("2", f"… {len(hits) - per} more · run s to page or filter, or s -p | cat for all"))
 
 
-def self_update():
+def replace_with_release(url, path, label):
+    """Download a script from the repo and put it at path. -> (old version, new version)."""
     import urllib.request
-    path = os.path.realpath(__file__)
     try:
-        data = urllib.request.urlopen(UPDATE_URL, timeout=20).read()
+        data = urllib.request.urlopen(url, timeout=20).read()
     except Exception as e:  # noqa: BLE001
         sys.exit(f"download failed: {e}")
     compile(data, path, "exec")  # refuse to install a broken script
-    m = re.search(rb'^VERSION = "([^"]+)"', data, re.M)
-    new = m.group(1).decode() if m else "?"
-    if new == VERSION:
-        print(f"sessions {VERSION} is already the latest")
+    new = re.search(rb'^VERSION = "([^"]+)"', data, re.M)
+    new = new.group(1).decode() if new else "?"
+    try:
+        with open(path) as f:
+            old = re.search(r'^VERSION = "([^"]+)"', f.read(), re.M)
+        old = old.group(1) if old else "?"
+    except OSError:
+        old = None
+    if new == old:
+        print(f"{label} {old} is already the latest")
         return
     tmp = path + ".new"
     with open(tmp, "wb") as f:
         f.write(data)
     os.chmod(tmp, 0o755)
     os.replace(tmp, path)
-    print(f"sessions updated {VERSION} -> {new}")
+    print(f"{label} updated {old} -> {new}")
+
+
+def self_update():
+    me = os.path.realpath(__file__)
+    replace_with_release(UPDATE_URL, me, "sessions")
+    bridge = os.path.join(os.path.dirname(me), "ai-bridge")
+    if os.path.exists(bridge):  # its companion, when installed beside it
+        replace_with_release(UPDATE_URL.rsplit("/", 1)[0] + "/ai-bridge", bridge, "ai-bridge")
 
 
 def to_json(s):
