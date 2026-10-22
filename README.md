@@ -120,6 +120,12 @@ Any session can also be continued in the other tool:
 - `cs 3 --claude` (or `c 3`) writes the Codex conversation out as a transcript and starts
   Claude Code in the same folder, asking it to read the transcript and say where things stand.
 
+A conversation that moved between the tools stays one row, marked `⇄`, with the work of both
+added up. Its number always opens wherever you worked on it last, in that tool, so you never
+land in a stale copy. `cs show` lists every step of the chain, and `cs <session id>` opens one
+particular step. `cs` recognises the moves it makes itself, Codex's own `/codex:transfer`
+imports, and a session that read the other tool's transcript to pick up where it left off.
+
 `cs codex` and `cs claude` filter the list by tool. Set `CS_CODEX_ARGS` to pass flags to every
 Codex that `cs` starts, for example `export CS_CODEX_ARGS="-p work"` for a profile.
 
@@ -150,6 +156,7 @@ deletes nothing.
 | `cs` | the picker: last two weeks, newest first |
 | `cs 3` | resume number 3 |
 | `cs 3 --codex` · `cs 3 --claude` | continue number 3 in Codex · in Claude Code |
+| `cs 1a2b3c4d` | open exactly that session (by id), even one step of a `⇄` chain |
 | `cs tiktok` | filter by any word; resumes at once if only one matches |
 | `cs running` · `cs cron` · `cs @studio` | only running sessions, only sessions with jobs, only one machine |
 | `cs codex` · `cs claude` | only Codex sessions · only Claude Code sessions |

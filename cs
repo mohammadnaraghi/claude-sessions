@@ -15,6 +15,9 @@ Usage
   cs 3 --codex           continue it in Codex instead (--claude: in Claude Code).
                          Claude -> Codex imports the full conversation as a Codex
                          thread; Codex -> Claude hands Claude its transcript.
+                         A conversation continued that way stays one row (⇄);
+                         its number opens wherever you worked on it last.
+  cs <session id>        open exactly that session, even inside such a chain
   cs tiktok              filter by text; resumes directly on a single match
                          ("running", "cron", "claude" and "codex" filter by
                          status or tool, @studio by host)
@@ -98,13 +101,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/claude-sessions/main/cs"
 CLAUDE_DIR = os.environ.get("CS_CLAUDE_DIR") or os.path.expanduser("~/.claude")  # override for tests
 PROJECTS = os.path.join(CLAUDE_DIR, "projects")
 CACHE_DIR = os.environ.get("CS_CACHE_DIR") or os.path.expanduser("~/.cache/claude-sessions")
 CACHE = os.path.join(CACHE_DIR, "cache.json")
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 HOSTS_FILE = os.path.expanduser("~/.config/cs/hosts")
 HOME = os.environ.get("CS_HOME") or os.path.expanduser("~")  # override for tests
 HOME_RE = re.compile(r"^/(?:Users|home)/[^/]+")
@@ -112,7 +115,7 @@ GAP = 30 * 60  # silence longer than this is not counted as work
 CRON_LIFETIME = timedelta(days=7)  # recurring in-session jobs auto-expire after this
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 CODEX_CACHE = os.path.join(CACHE_DIR, "codex.json")
-CODEX_CACHE_VERSION = 1
+CODEX_CACHE_VERSION = 2
 # files Codex rewrites whenever a thread changes; while none is newer, the cached list is current
 CODEX_STAMP_FILES = ("session_index.jsonl", "state_*.sqlite*", "thread_history_*.sqlite*")
 HANDOFF_DIR = os.path.join(CACHE_DIR, "handoffs")  # Codex transcripts handed to Claude
@@ -130,6 +133,12 @@ SKIP_PREFIX = (
     "<command-args>", "<bash-input>", "<bash-stdout>", "<bash-stderr>", "Caveat:",
     "This session is being continued", "<ide_opened_file>", "<ide_selection>",
 )
+UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+# How one tool's session points at the other's: a Codex transcript handed to Claude (by cs or by
+# ai-bridge), or a command that reads the other tool's session ("continue where Codex left off").
+HANDOFF_RE = re.compile(r"handoffs/(?:\d{8}-\d{4}-)?(" + UUID + r")\.md")
+READS_CODEX_RE = re.compile(r"codex-transcript\s+(" + UUID + ")")
+READS_CLAUDE_RE = re.compile(r"claude-transcript\s+(" + UUID + ")")
 PASTE_RE = re.compile(r"</?pasted_content[^>]*>")
 REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 WS_RE = re.compile(r"\s+")
@@ -202,7 +211,13 @@ def new_state():
                 assistant=0, tools=0, cwd=None, branch=None, model=None,
                 ai_title=None, custom_title=None, first_prompts=[], last_prompts=[],
                 last_prompt_ts=None, last_said=None, open_tools={}, ctx_tokens=0,
-                todo=None, jobs={}, pending_cron={})
+                todo=None, jobs={}, pending_cron={}, links=[])
+
+
+def add_links(st, pattern, text):
+    for other in pattern.findall(text or ""):
+        if other not in st["links"] and len(st["links"]) < 20:
+            st["links"].append(other)
 
 
 def parse(path, st):
@@ -283,6 +298,7 @@ def parse(path, st):
             txt = prompt_text(content)
             if not txt:
                 continue
+            add_links(st, HANDOFF_RE, txt)
             st["user"] += 1
             st["last_prompt_ts"] = ts.isoformat()
             item = [ts.isoformat(), txt[:400]]
@@ -315,6 +331,8 @@ def parse(path, st):
                     st["open_tools"][x["id"]] = [ts.isoformat(), nm, tool_summary(nm, inp)]
                     while len(st["open_tools"]) > 8:
                         del st["open_tools"][next(iter(st["open_tools"]))]
+                    if nm == "Bash":
+                        add_links(st, READS_CODEX_RE, inp.get("command"))
                     if nm == "CronCreate":
                         st["pending_cron"][x["id"]] = {
                             "cron": inp.get("cron"), "recurring": inp.get("recurring", True),
@@ -485,11 +503,11 @@ def item_text(item):
 def codex_state(srv, t):
     """A Codex thread summarised into the same fields a Claude transcript gets."""
     st = new_state()
-    st.update(cwd=t.get("cwd"), model=t.get("model"), ai_title=t.get("name") or None, tools=None,
+    st.update(cwd=t.get("cwd"), model=t.get("model"), ai_title=t.get("name") or None,
               branch=(t.get("gitInfo") or {}).get("branch"))
     turns, cursor = [], None
     while len(turns) < 5000:
-        params = {"threadId": t["id"], "limit": 200, "itemsView": "summary", "sortDirection": "asc"}
+        params = {"threadId": t["id"], "limit": 50, "itemsView": "full", "sortDirection": "asc"}
         if cursor:
             params["cursor"] = cursor
         page = srv.request("thread/turns/list", params)
@@ -528,6 +546,11 @@ def codex_state(srv, t):
             elif item.get("type") == "agentMessage" and (item.get("text") or "").strip():
                 st["assistant"] += 1
                 st["last_said"] = [iso(end), WS_RE.sub(" ", item["text"]).strip()[:300]]
+            elif item.get("type") in ("commandExecution", "fileChange", "mcpToolCall",
+                                      "dynamicToolCall", "webSearch"):
+                st["tools"] += 1
+                if item.get("type") == "commandExecution":
+                    add_links(st, READS_CLAUDE_RE, item.get("command"))
     st["first"] = iso(first or t.get("createdAt") or 0)
     st["last"] = iso(max(x for x in (last, t.get("updatedAt"), first, 0) if x is not None))
     return st
@@ -677,6 +700,76 @@ def handoff_prompt(path):
 
 def codex_args():
     return shlex.split(os.environ.get("CS_CODEX_ARGS", ""))
+
+
+# ----------------------------------------------------------------- conversations across tools
+
+def link_sessions(sessions):
+    """Mark this machine's sessions that continue one another across Claude Code and Codex:
+    each gets `group` (shared key) and `chain` (all of them, oldest first)."""
+    by_id = {s["id"]: s for s in sessions}
+    parent = {}
+
+    def root(x):
+        while parent.get(x, x) != x:
+            x = parent[x]
+        return x
+
+    def join(a, b):
+        if a in by_id and b in by_id and root(a) != root(b):
+            parent[root(a)] = root(b)
+
+    try:  # Codex's own record of the Claude transcripts it imported (cs --codex, /codex:transfer)
+        with open(os.path.join(CODEX_HOME, "external_agent_session_imports.json")) as f:
+            records = json.load(f).get("records") or []
+    except (OSError, ValueError):
+        records = []
+    for r in records:
+        src = os.path.basename(r.get("source_path") or "")
+        if src.endswith(".jsonl"):
+            join(src[:-6], r.get("imported_thread_id"))
+    for s in sessions:
+        for other in s.get("links") or []:
+            join(s["id"], other)
+    groups = {}
+    for s in sessions:
+        groups.setdefault(root(s["id"]), []).append(s)
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda m: m["last"])
+        chain = [{"id": m["id"], "app": app_of(m), "last": m["last"], "name": name(m)} for m in members]
+        for m in members:
+            m["group"], m["chain"] = members[0]["id"], chain
+
+
+def merge_rows(sessions):
+    """One row per conversation: sessions continued across tools become one row that carries
+    the latest session (so resuming it picks up where you worked last) and their combined work."""
+    rows, groups = [], {}
+    for s in sessions:
+        if s.get("group"):
+            groups.setdefault((s.get("host"), s["group"]), []).append(s)
+        else:
+            rows.append(s)
+    for members in groups.values():
+        latest = max(members, key=lambda m: m["last"])
+        first = min(members, key=lambda m: m.get("first") or m["last"])
+        days = {}
+        for m in members:
+            for d, v in (m.get("days") or {}).items():
+                days[d] = days.get(d, 0) + v
+        row = dict(latest)
+        row.update(days=days, active=sum(m.get("active") or 0 for m in members),
+                   user=sum(m.get("user") or 0 for m in members), first=first.get("first"),
+                   first_prompts=first.get("first_prompts") or [],
+                   last_prompts=((latest.get("first_prompts") or []) + (latest.get("last_prompts") or []))[-4:],
+                   ai_title=first.get("ai_title"),
+                   custom_title=next((m["custom_title"] for m in sorted(members, key=lambda m: m["last"],
+                                                                         reverse=True)
+                                      if m.get("custom_title")), None))
+        rows.append(row)
+    return rows
 
 
 # ----------------------------------------------------------------- live state
@@ -1000,7 +1093,7 @@ def from_json(o, host):
     s["host"] = host
     for k, v in (("project_dir", ""), ("open_tools", {}), ("todo", None), ("last_said", None),
                  ("ctx_tokens", 0), ("last_prompt_ts", None), ("branch", None), ("model", None),
-                 ("app", "claude")):
+                 ("app", "claude"), ("group", None), ("chain", None)):
         s.setdefault(k, v)
     s["_running"] = o.get("running")
     s["_daemon"] = o.get("daemon")
@@ -1575,7 +1668,8 @@ def matches(s, query):
         if hay is None:
             hay = " ".join([s["id"], project(s), name(s), s.get("ai_title") or "", last_prompt(s),
                             s.get("host") or ""]
-                           + [p[1] for p in s["first_prompts"] + s["last_prompts"]]).lower()
+                           + [p[1] for p in s["first_prompts"] + s["last_prompts"]]
+                           + [m["id"] + " " + m["name"] for m in s.get("chain") or []]).lower()
         if w not in hay:
             return False
     return True
@@ -1672,6 +1766,11 @@ def app_of(s):
     return s.get("app") or "claude"
 
 
+def app_cell(s):
+    """'claude' / 'codex', with ⇄ when the conversation moved between the two."""
+    return ("⇄" if s.get("chain") else " ") + app_of(s)
+
+
 APP_LABEL = {"claude": "Claude Code", "codex": "Codex"}
 APP_COLOR = {"claude": "33", "codex": "34"}
 
@@ -1685,7 +1784,7 @@ def print_list(view, start=0, count=None):
     gutter = "   "
     show_proj = cols >= 100
     show_work = cols >= 80
-    show_app = any(app_of(s) != "claude" for s in view)
+    show_app = any(app_of(s) != "claude" or s.get("chain") for s in view)
     hw = max([4] + [len(h) for h in HOSTS]) if HOSTS else 0
     nw = min(38, max(len(name(s)) for s in rows))
     pw = min(18, max(len(short_project(s)) for s in rows)) if show_proj else 0
@@ -1693,7 +1792,7 @@ def print_list(view, start=0, count=None):
     if hw:
         fixed += hw + len(gutter)
     if show_app:
-        fixed += 6 + len(gutter)
+        fixed += 7 + len(gutter)
     if show_work:
         fixed += 5 + len(gutter)
     if show_proj:
@@ -1705,7 +1804,7 @@ def print_list(view, start=0, count=None):
         if hw:
             cells.append((f"{host:<{hw}}", "35"))
         if show_app:
-            cells.append((f"{app:<6}", APP_COLOR.get(app, "")))
+            cells.append((f"{app:<7}", APP_COLOR.get(app.strip(" ⇄"), "")))
         cells.append((f"{last:<7}", "32" if ("m ago" in last or "h ago" in last) else ""))
         if show_work:
             cells.append((f"{work:>5}", ""))
@@ -1717,9 +1816,9 @@ def print_list(view, start=0, count=None):
             return c("2", gutter.join(t for t, _ in cells))
         return gutter.join(t if code is None else (c(code, t) if code else t) for t, code in cells)
 
-    print(row("#", "  ", "host", "app", "last", "work", "session", "project", "last prompt", header=True))
+    print(row("#", "  ", "host", " app", "last", "work", "session", "project", "last prompt", header=True))
     for i, s in enumerate(rows, start + 1):
-        print(row(i, flags(s), s.get("host") or "", app_of(s), rel(s["last"]), hm(s["active_win"]),
+        print(row(i, flags(s), s.get("host") or "", app_cell(s), rel(s["last"]), hm(s["active_win"]),
                   fit(name(s), nw), fit(short_project(s), pw), fit(last_prompt(s), lw)))
 
 
@@ -1871,6 +1970,14 @@ def show(s):
         print(c("1", "Latest prompts"))
         for ts, p in s["last_prompts"]:
             print(f"  {parse_ts(ts).astimezone():%b %d %H:%M}  {fit(p, 200)}")
+    chain = s.get("chain") or []
+    if chain:
+        print(c("1", "Chain") + c("2", "    this conversation moved between tools; its number opens the latest"))
+        for i, m in enumerate(chain):
+            mark = c("32", "  ← latest") if m["id"] == chain[-1]["id"] else ""
+            print(f"  {'→' if i else ' '} {c(APP_COLOR.get(m['app'], ''), m['app'].ljust(6))} "
+                  f"{when(m['last'])}  {fit(m['name'], 50).ljust(50)}  {c('2', m['id'][:8])}{mark}")
+        print(c("2", "  (cs <id> opens exactly that session)"))
     print(c("1", "Resume   ") + resume_command(s, [])[1])
     other = "codex" if app_of(s) == "claude" else "claude"
     print(c("1", APP_LABEL[other].split()[0].ljust(9)) + f"cs {s['id'][:8]} --{other}"
@@ -1976,13 +2083,13 @@ def resume(s, extra, dry_run, target=None):
 def pick_fzf(view, self_path):
     """-> (session, target tool) or None."""
     lines = []
-    apps = any(app_of(s) != "claude" for s in view)
+    apps = any(app_of(s) != "claude" or s.get("chain") for s in view)
     for s in view:
         r = running_of(s)
         mark = ("●" if r else " ") + ("↻" if s["jobs"] else " ")
         host = f"{(s.get('host') or ''):<8}" if HOSTS else ""
         lines.append("\t".join([s["id"], mark + ("  " + host if host else ""),
-                                *([f"{app_of(s):<6}"] if apps else []), f"{rel(s['last']):<7}",
+                                *([f"{app_cell(s):<7}"] if apps else []), f"{rel(s['last']):<7}",
                                 f"{hm(s['active_win']):>5}", fit(name(s), 38).ljust(38),
                                 fit(short_project(s), 18).ljust(18), last_prompt(s)]))
     try:
@@ -2125,7 +2232,7 @@ def self_update():
 def to_json(s):
     keys = ("id", "app", "cwd", "project_dir", "host", "branch", "custom_title", "ai_title", "first", "last",
             "active", "active_win", "days", "user", "assistant", "tools", "model", "ctx_tokens", "todo",
-            "last_said", "last_prompt_ts", "first_prompts", "last_prompts")
+            "last_said", "last_prompt_ts", "first_prompts", "last_prompts", "group", "chain")
     return {"name": name(s), "last_prompt": last_prompt(s), "running": running_of(s), "doing": doing(s),
             "daemon": daemon_of(s),
             "jobs": [dict({k: v for k, v in j.items() if k != "sessions"}, status=st, fires_text=text,
@@ -2225,6 +2332,7 @@ def main():
         codex, codex_note = codex_job.result() if codex_job else ([], None)
     _ALL_SESSIONS = local
     sessions = local + codex
+    link_sessions(sessions)  # other machines link their own before answering
     notes = [codex_note] if codex_note else []
     if lookup and HOSTS and len([s for s in sessions if s["id"].startswith(lookup)]) != 1:
         pending = start_remote(HOSTS, a.days)
@@ -2236,7 +2344,7 @@ def main():
     if notes and not a.json:
         for n in notes:
             print(c("33", n), file=sys.stderr)
-    view = select(sessions, a.days, a.min, a.sort)
+    view = select(merge_rows(sessions), a.days, a.min, a.sort)  # one row per conversation
 
     if rest == ["live"]:
         pool = select(sessions, a.days, 0, "recent")
@@ -2261,10 +2369,17 @@ def main():
         return
 
     if a.json:
-        print(json.dumps([to_json(s) for s in view], indent=1))
+        # every session on its own (with its group), so the asking machine can merge and still see
+        # which ones are running
+        print(json.dumps([to_json(s) for s in select(sessions, a.days, a.min, a.sort)], indent=1))
         return
 
     query = " ".join(rest)
+    if re.fullmatch(r"[0-9a-f][0-9a-f-]{7,}", query) and not a.print:
+        exact = [s for s in sessions if s["id"].startswith(query)]
+        if len(exact) == 1:  # a session id opens exactly that session, even inside a chain
+            resume(exact[0], extra, a.dry_run, target)
+            return
     if query.isdigit():
         resume(find(view, sessions, query), extra, a.dry_run, target)
         return
