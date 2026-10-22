@@ -2,9 +2,9 @@
 """Render the README screenshots from fictional demo data.
 
 Builds two fake ~/.claude folders (this machine and a remote one called "studio"),
-runs the real `cs` code against them with the remote side faked, and turns the
+runs the real `s` code against them with the remote side faked, and turns the
 coloured terminal output into SVG files in docs/. Nothing here touches your own
-~/.claude. Run from the repo root:  python3 docs/make-screenshots.py
+~/.claude or ~/.codex. Run from the repo root:  python3 docs/make-screenshots.py
 """
 import importlib.machinery
 import importlib.util
@@ -18,7 +18,7 @@ import tempfile
 from datetime import datetime, timedelta
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CS = os.path.join(ROOT, "cs")
+SCRIPT = os.path.join(ROOT, "s")
 OUT = os.path.join(ROOT, "docs")
 NOW = datetime.now().astimezone()
 COLS = 108
@@ -214,6 +214,40 @@ def build_local(claude_dir, home, pid):
         json.dump({"model": "opus", "permissions": {"allow": ["Bash(npm test)", "Bash(git diff *)"]}}, f, indent=2)
 
 
+def codex_demo(tool, home):
+    """Two Codex threads: one that continues a Claude session (so the two show as one ⇄ row,
+    opening the Codex thread), and one on its own."""
+    h = lambda p: os.path.join(home, p)  # noqa: E731
+    ago = lambda **kw: NOW - timedelta(**kw)  # noqa: E731
+
+    def thread(tid, cwd, title, start, minutes, prompts, said, links=()):
+        st = tool.new_state()
+        step = timedelta(minutes=minutes / max(1, len(prompts)))
+        for i, p in enumerate(prompts):
+            entry = [ts(start + step * i), p]
+            (st["first_prompts"] if len(st["first_prompts"]) < 5 else st["last_prompts"]).append(entry)
+        end = start + timedelta(minutes=minutes)
+        st.update(cwd=cwd, branch="main", model="gpt-6-astra", ai_title=title, first=ts(start), last=ts(end),
+                  active=minutes * 60.0, days={start.astimezone().strftime("%Y-%m-%d"): minutes * 60.0},
+                  user=len(prompts), assistant=len(prompts), tools=3 * len(prompts), last_said=[ts(end), said],
+                  links=list(links))
+        return dict(st, id=tid, path=None, project_dir="", host=None, app="codex")
+
+    return [
+        thread("c3d4e5f6-0000-4000-8000-000000000001", h("code/api"), "Search ranking fuzz tests",
+               ago(hours=1, minutes=10), 55,
+               ["pick up the fuzz failures from Claude's run and fix the tie-breaking",
+                "rerun the fuzz suite with 10k cases", "open a PR with the fix"],
+               "All 10k cases pass; ties now break on the stable document id. The PR is open.",
+               links=["a1b2c3d4-0000-4000-8000-000000000004"]),
+        thread("c3d4e5f6-0000-4000-8000-000000000002", h("code/site"), "Image pipeline for the landing page",
+               ago(hours=5), 40,
+               ["convert the hero images to AVIF with a JPEG fallback",
+                "check the Lighthouse score after the change"],
+               "Hero images are AVIF now; Lighthouse performance went from 71 to 93."),
+    ]
+
+
 def build_remote(claude_dir, home, pid):
     h = lambda p: os.path.join(home, p)  # noqa: E731
     ago = lambda **kw: NOW - timedelta(**kw)  # noqa: E731
@@ -257,30 +291,30 @@ def build_remote(claude_dir, home, pid):
 # ----------------------------------------------------------------- capture
 
 
-def load_cs():
-    loader = importlib.machinery.SourceFileLoader("cs", CS)
-    spec = importlib.util.spec_from_loader("cs", loader)
+def load_tool():
+    loader = importlib.machinery.SourceFileLoader("sessions", SCRIPT)
+    spec = importlib.util.spec_from_loader("sessions", loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
     return mod
 
 
-def capture(cs, argv, cols=COLS, lines=40, picker=False):
+def capture(tool, argv, cols=COLS, lines=40, picker=False):
     os.environ["COLUMNS"], os.environ["LINES"] = str(cols), str(lines)
-    cs.TTY = True
-    cs._RUNNING = None
-    cs._JOB_INDEX = None
-    cs.HOSTS = {}
+    tool.TTY = True
+    tool._RUNNING = None
+    tool._JOB_INDEX = None
+    tool.HOSTS = {}
     buf = io.StringIO()
     old_out, old_argv = sys.stdout, sys.argv
-    sys.stdout, sys.argv = buf, ["cs", *argv]
+    sys.stdout, sys.argv = buf, ["s", *argv]
     if picker:
         import builtins
         old_input, old_isatty = builtins.input, sys.stdin.isatty
         builtins.input = lambda *a, **k: (_ for _ in ()).throw(EOFError())
         sys.stdin.isatty = lambda: True
     try:
-        cs.main()
+        tool.main()
     except SystemExit:
         pass
     finally:
@@ -293,7 +327,7 @@ def capture(cs, argv, cols=COLS, lines=40, picker=False):
 
 # ----------------------------------------------------------------- ansi -> svg
 
-PALETTE = {"31": "#f38ba8", "32": "#a6e3a1", "33": "#f9e2af", "35": "#cba6f7", "36": "#89dceb"}
+PALETTE = {"31": "#f38ba8", "32": "#a6e3a1", "33": "#f9e2af", "34": "#89b4fa", "35": "#cba6f7", "36": "#89dceb"}
 FG, DIM, BOLD_FG, BG, CHROME = "#cdd6f4", "#7f849c", "#ffffff", "#1e1e2e", "#181825"
 CW, LH, FS, PAD, BAR = 7.6, 19, 12.6, 18, 38
 
@@ -370,7 +404,7 @@ def svg(text, title, path, cols=COLS):
 
 
 def main():
-    tmp = tempfile.mkdtemp(prefix="cs-demo-")
+    tmp = tempfile.mkdtemp(prefix="sessions-demo-")
     home_local, home_remote = os.path.join(tmp, "home", "sam"), "/home/sam"
     local, remote = os.path.join(tmp, "local-claude"), os.path.join(tmp, "remote-claude")
     sleeper = subprocess.Popen(["sleep", "600"])
@@ -385,25 +419,27 @@ def main():
                                       "datadog": {"url": "https://mcp.datadoghq.com/"}}}, f)
 
         # the remote machine's answers, produced by the real script against the remote demo folder
-        env = dict(os.environ, CS_CLAUDE_DIR=remote, CS_CLAUDE_JSON=os.path.join(tmp, "remote.claude.json"),
-                   CS_HOME=home_remote, CS_CACHE_DIR=os.path.join(tmp, "remote-cache"))
-        p = subprocess.run([sys.executable, CS, "--json", "--local", "-a"], env=env, capture_output=True, text=True)
+        env = dict(os.environ, SESSIONS_CLAUDE_DIR=remote, SESSIONS_CLAUDE_JSON=os.path.join(tmp, "remote.claude.json"),
+                   SESSIONS_HOME=home_remote, SESSIONS_CACHE_DIR=os.path.join(tmp, "remote-cache"),
+                   SESSIONS_CONFIG_DIR=os.path.join(tmp, "remote-config"), CODEX_HOME=os.path.join(tmp, "codex"))
+        p = subprocess.run([sys.executable, SCRIPT, "--json", "--local", "-a", "--no-codex"], env=env, capture_output=True, text=True)
         if p.returncode != 0:
             sys.exit("remote demo failed:\n" + p.stderr)
         remote_json = json.loads(p.stdout)
         for s in remote_json:
             if s.get("running"):
                 s["running"]["tmux"] = "main:1.0"
-        remote_export = subprocess.run([sys.executable, CS, "_export", "--items", "memory,configs"], env=env,
+        remote_export = subprocess.run([sys.executable, SCRIPT, "_export", "--items", "memory,configs"], env=env,
                                        capture_output=True, check=True).stdout
 
-        os.environ["CS_CLAUDE_DIR"], os.environ["CS_CLAUDE_JSON"] = local, os.path.join(tmp, "local.claude.json")
-        os.environ["CS_HOME"], os.environ["CS_CACHE_DIR"] = home_local, os.path.join(tmp, "local-cache")
-        cs = load_cs()
-        cs.HOSTS_FILE = os.path.join(tmp, "hosts")
-        cs.SYNC_STATE_DIR = os.path.join(tmp, "sync")
-        cs.CACHE = os.path.join(tmp, "cache.json")
-        with open(cs.HOSTS_FILE, "w") as f:
+        os.environ["SESSIONS_CLAUDE_DIR"], os.environ["SESSIONS_CLAUDE_JSON"] = local, os.path.join(tmp, "local.claude.json")
+        os.environ["SESSIONS_HOME"], os.environ["SESSIONS_CACHE_DIR"] = home_local, os.path.join(tmp, "local-cache")
+        os.environ["SESSIONS_CONFIG_DIR"], os.environ["CODEX_HOME"] = os.path.join(tmp, "config"), os.path.join(tmp, "codex")
+        tool = load_tool()
+        tool.HOSTS_FILE = os.path.join(tmp, "hosts")
+        tool.SYNC_STATE_DIR = os.path.join(tmp, "sync")
+        tool.CACHE = os.path.join(tmp, "cache.json")
+        with open(tool.HOSTS_FILE, "w") as f:
             f.write("studio sam@studio.local\n")
 
         class R:
@@ -417,9 +453,15 @@ def main():
             if cmd[0] == "ssh" and "--json" in tail:
                 return R(json.dumps(remote_json))
             if cmd[0] == "ssh":
-                return R("cs 0.4.0\ntmux\n")
+                return R(f"sessions {tool.VERSION}\ntmux\n")
             return R("")
-        cs.subprocess.run = fake_run
+        tool.subprocess.run = fake_run
+        # other machines answer through a background ssh in real use; here studio answers at once
+        tool.start_remote = lambda hosts, days: {"hosts": hosts}
+        tool.finish_remote = lambda pending, wait=None: [
+            (label, [tool.from_json(o, label) for o in remote_json], None) for label in pending["hosts"]]
+        demo_codex = codex_demo(tool, home_local)
+        tool.load_codex = lambda days, rescan=False: ([dict(s) for s in demo_codex], None)
 
         home_re = re.escape(home_local)
 
@@ -427,12 +469,12 @@ def main():
             return re.sub(home_re, "~", text)
 
         os.makedirs(OUT, exist_ok=True)
-        svg(tidy(capture(cs, [], lines=22, picker=True)), "cs", os.path.join(OUT, "picker.svg"))
-        svg(tidy(capture(cs, ["live"])), "cs live", os.path.join(OUT, "live.svg"))
-        svg(tidy(capture(cs, ["show", "a1b2c3d4-0000-4000-8000-000000000002"])), "cs show 2", os.path.join(OUT, "show.svg"))
-        svg(tidy(capture(cs, ["jobs"])), "cs jobs", os.path.join(OUT, "jobs.svg"))
-        svg(tidy(capture(cs, ["sync", "studio", "-n"])), "cs sync studio -n", os.path.join(OUT, "sync.svg"))
-        svg(tidy(capture(cs, ["hosts"])), "cs hosts", os.path.join(OUT, "hosts.svg"))
+        svg(tidy(capture(tool, [], cols=124, lines=22, picker=True)), "s", os.path.join(OUT, "picker.svg"), cols=124)
+        svg(tidy(capture(tool, ["live"])), "s live", os.path.join(OUT, "live.svg"))
+        svg(tidy(capture(tool, ["show", "a1b2c3d4-0000-4000-8000-000000000002"])), "s show 2", os.path.join(OUT, "show.svg"))
+        svg(tidy(capture(tool, ["jobs"])), "s jobs", os.path.join(OUT, "jobs.svg"))
+        svg(tidy(capture(tool, ["sync", "studio", "-n"])), "s sync studio -n", os.path.join(OUT, "sync.svg"))
+        svg(tidy(capture(tool, ["hosts"])), "s hosts", os.path.join(OUT, "hosts.svg"))
     finally:
         sleeper.kill()
         sleeper2.kill()

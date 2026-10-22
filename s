@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cs - Claude Code and Codex session picker.
+"""sessions (command: s) - Claude Code and Codex session picker.
 
 Lists your recent Claude Code and Codex CLI sessions across every project
 folder, and across other machines over ssh, shows what each one was about, and
@@ -10,29 +10,29 @@ which sessions are running right now and what they are doing, and which ones
 set up cron jobs.
 
 Usage
-  cs                     interactive picker (last 14 days, >= 10 min of work)
-  cs 3                   resume the 3rd session in that list, in its own tool
-  cs 3 --codex           continue it in Codex instead (--claude: in Claude Code).
+  s                      interactive picker (last 14 days, >= 10 min of work)
+  s 3                    resume the 3rd session in that list, in its own tool
+  s 3 --codex            continue it in Codex instead (--claude: in Claude Code).
                          Claude -> Codex imports the full conversation as a Codex
                          thread; Codex -> Claude hands Claude its transcript.
                          A conversation continued that way stays one row (⇄);
                          its number opens wherever you worked on it last.
-  cs <session id>        open exactly that session, even inside such a chain
-  cs tiktok              filter by text; resumes directly on a single match
+  s <session id>         open exactly that session, even inside such a chain
+  s tiktok               filter by text; resumes directly on a single match
                          ("running", "cron", "claude" and "codex" filter by
                          status or tool, @studio by host)
-  cs show 3 | show <id>  details: work per day, prompts, live status, cron jobs
-  cs live                running sessions: what they are doing and how far along
-  cs jobs                every in-session cron job and its status
-  cs path 3              print the session's directory  ->  cd "$(cs path 3)"
-  cs -p                  print the list and exit (all rows when piped)
-  cs update              replace this script with the latest release
+  s show 3 | show <id>   details: work per day, prompts, live status, cron jobs
+  s live                 running sessions: what they are doing and how far along
+  s jobs                 every in-session cron job and its status
+  s path 3               print the session's directory  ->  cd "$(s path 3)"
+  s -p                   print the list and exit (all rows when piped)
+  s update               replace this script with the latest release
 
 Other machines (over ssh, key auth)
-  cs hosts                       list configured hosts and check them
-  cs hosts add studio user@host  add a host (label, then ssh destination)
-  cs hosts setup studio          copy cs to that host so it can answer
-  cs hosts rm studio             remove a host
+  s hosts                        list configured hosts and check them
+  s hosts add studio user@host   add a host (label, then ssh destination)
+  s hosts setup studio           copy sessions to that host so it can answer
+  s hosts rm studio              remove a host
   Sessions from every host then appear in the list with a host column.
   Resuming one starts claude there inside a tmux session (when tmux is
   installed there), so closing your laptop only detaches it and picking
@@ -41,7 +41,7 @@ Other machines (over ssh, key auth)
   --no-tmux runs plainly over ssh -t.
 
 Memories and configs between machines
-  cs sync studio                 two-way sync of Claude's memory folders and
+  s sync studio                  two-way sync of Claude's memory folders and
                                  your configs (settings.json, CLAUDE.md,
                                  keybindings, commands, agents, hooks, skills,
                                  MCP servers). Newest copy wins per file;
@@ -50,8 +50,8 @@ Memories and configs between machines
                                  sync is deleted on the other. Shows the plan
                                  and asks before changing anything; replaced
                                  files are kept under ~/.claude/backups.
-  cs migrate to studio           copy everything here onto a new machine
-  cs migrate from studio         the other way round (no deletions either way)
+  s migrate to studio            copy everything here onto a new machine
+  s migrate from studio          the other way round (no deletions either way)
   --memory | --configs           only one of the two groups
   --prefer local|remote          who wins conflicts (default: newest)
   -n                             dry run      -y   apply without asking
@@ -72,9 +72,9 @@ Options
   --rescan               rebuild the cache from scratch
   --no-fzf               use the built-in picker even if fzf is installed
   -v, --version          print the version
-  -- ARGS                pass ARGS to claude or codex, e.g.  cs 2 -- --model opus
-  CS_CODEX_ARGS          extra arguments for every codex it starts, e.g.
-                         export CS_CODEX_ARGS="-p astra"
+  -- ARGS                pass ARGS to claude or codex, e.g.  s 2 -- --model opus
+  SESSIONS_CODEX_ARGS    extra arguments for every codex it starts, e.g.
+                         export SESSIONS_CODEX_ARGS="-p astra"
 
 Other machines answer within about a second; one that is slower is shown as of
 its last answer and refreshed in the background for next time.
@@ -101,23 +101,35 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
 
-VERSION = "0.6.2"
-UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/claude-sessions/main/cs"
-CLAUDE_DIR = os.environ.get("CS_CLAUDE_DIR") or os.path.expanduser("~/.claude")  # override for tests
+VERSION = "0.7.0"
+UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/sessions/main/s"
+
+
+def env(name):
+    """SESSIONS_<name>, or the CS_<name> spelling from when this tool was called cs."""
+    return os.environ.get("SESSIONS_" + name) or os.environ.get("CS_" + name)
+
+
+CLAUDE_DIR = env("CLAUDE_DIR") or os.path.expanduser("~/.claude")  # override for tests
 PROJECTS = os.path.join(CLAUDE_DIR, "projects")
-CACHE_DIR = os.environ.get("CS_CACHE_DIR") or os.path.expanduser("~/.cache/claude-sessions")
+CONFIG_DIR = env("CONFIG_DIR") or os.path.expanduser("~/.config/sessions")
+CACHE_DIR = env("CACHE_DIR") or os.path.expanduser("~/.cache/sessions")
+# where this tool kept its files while it was called cs; moved over on first run
+OLD_DIRS = tuple((os.path.expanduser(old), new) for old, new, overridden in (
+    ("~/.config/cs", CONFIG_DIR, env("CONFIG_DIR")),
+    ("~/.cache/claude-sessions", CACHE_DIR, env("CACHE_DIR"))) if not overridden)
 CACHE = os.path.join(CACHE_DIR, "cache.json")
 CACHE_VERSION = 5
-HOSTS_FILE = os.path.expanduser("~/.config/cs/hosts")
-HOME = os.environ.get("CS_HOME") or os.path.expanduser("~")  # override for tests
+HOSTS_FILE = os.path.join(CONFIG_DIR, "hosts")
+HOME = env("HOME") or os.path.expanduser("~")  # override for tests
 HOME_RE = re.compile(r"^/(?:Users|home)/[^/]+")
 GAP = 30 * 60  # silence longer than this is not counted as work
 CRON_LIFETIME = timedelta(days=7)  # recurring in-session jobs auto-expire after this
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 CODEX_CACHE = os.path.join(CACHE_DIR, "codex.json")
 CODEX_CACHE_VERSION = 3
-# files Codex rewrites whenever a thread changes; while none is newer, the cached list is current
-CODEX_STAMP_FILES = ("session_index.jsonl", "state_*.sqlite*", "thread_history_*.sqlite*")
+# files Codex rewrites whenever a thread changes; while they look the same, the cached list is current
+CODEX_STAMP_FILES = ("session_index.jsonl", "state_*.sqlite", "thread_history_*.sqlite")
 HANDOFF_DIR = os.path.join(CACHE_DIR, "handoffs")  # transcripts handed from one tool to the other
 HANDOFF_MAX = 60_000
 # Codex models read about 272k tokens. A Claude conversation bigger than this is not imported
@@ -125,11 +137,11 @@ HANDOFF_MAX = 60_000
 IMPORT_MAX_TOKENS = 150_000
 REMOTE_WAIT = 1.2  # seconds to wait for other machines before showing their last answer
 # Reuse one ssh connection per host for a few minutes, so repeated runs skip the handshake.
-CONTROL_OPTS = (["-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/cs-%C", "-o", "ControlPersist=10m"]
+CONTROL_OPTS = (["-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/s-%C", "-o", "ControlPersist=10m"]
                 if os.path.isdir(os.path.expanduser("~/.ssh")) else [])
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=6", *CONTROL_OPTS]
-# Non-interactive ssh shells have a bare PATH; find cs where the installer puts it.
-REMOTE_CS = "sh -c 'PATH=\"$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; exec cs \"$@\"' cs"
+# Non-interactive ssh shells have a bare PATH; find s where the installer puts it.
+REMOTE_S = "sh -c 'PATH=\"$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; exec s \"$@\"' s"
 SKIP_PREFIX = (
     "<task-notification>", "<system-reminder>", "[Request interrupted",
     "<artifact-content", "<local-command", "<command-name>", "<command-message>",
@@ -137,7 +149,7 @@ SKIP_PREFIX = (
     "This session is being continued", "<ide_opened_file>", "<ide_selection>",
 )
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-# How one tool's session points at the other's: a Codex transcript handed to Claude (by cs or by
+# How one tool's session points at the other's: a Codex transcript handed to Claude (by s or by
 # ai-bridge), or a command that reads the other tool's session ("continue where Codex left off").
 HANDOFF_RE = re.compile(r"handoffs/(?:\d{8}-\d{4}-)?(" + UUID + r")\.md")
 READS_CODEX_RE = re.compile(r"codex-transcript\s+(" + UUID + ")")
@@ -417,7 +429,7 @@ class CodexServer:
             raise CodexError(f"cannot start codex: {e}")
         self.fd, self.buf, self.next_id, self.notes = self.proc.stdout.fileno(), b"", 0, []
         try:
-            self.request("initialize", {"clientInfo": {"name": "cs", "title": "cs", "version": VERSION},
+            self.request("initialize", {"clientInfo": {"name": "sessions", "title": "sessions", "version": VERSION},
                                         "capabilities": {"experimentalApi": False}}, timeout)
             self.send({"method": "initialized", "params": {}})
         except CodexError:
@@ -456,7 +468,7 @@ class CodexServer:
         return json.loads(line) if line.strip() else self.read(deadline)
 
     def handle(self, msg):
-        if "id" in msg and "method" in msg:  # a request from the server; cs answers none
+        if "id" in msg and "method" in msg:  # a request from the server; s answers none
             self.send({"id": msg["id"], "error": {"code": -32601, "message": "unsupported"}})
         elif "method" in msg:
             self.notes.append(msg)
@@ -489,14 +501,17 @@ def iso(ts):
 
 
 def codex_stamp():
-    newest = 0.0
+    """What Codex's files look like now. A database's write-ahead log counts by size: merely
+    opening the database (as `codex app-server` does when s asks it) touches its time."""
+    stamp = []
     for pat in CODEX_STAMP_FILES:
-        for p in glob.glob(os.path.join(CODEX_HOME, pat)):
-            try:
-                newest = max(newest, os.path.getmtime(p))
-            except OSError:
-                pass
-    return newest
+        for p in sorted(glob.glob(os.path.join(CODEX_HOME, pat))):
+            for path, field in ((p, "st_mtime"), (p + "-wal", "st_size")):
+                try:
+                    stamp.append(f"{os.path.basename(path)}:{getattr(os.stat(path), field)}")
+                except OSError:
+                    pass
+    return stamp
 
 
 def item_text(item):
@@ -785,7 +800,7 @@ def claude_handoff(s, summary, entries):
 
 
 def codex_args():
-    return shlex.split(os.environ.get("CS_CODEX_ARGS", ""))
+    return shlex.split(env("CODEX_ARGS") or "")
 
 
 # ----------------------------------------------------------------- conversations across tools
@@ -805,7 +820,7 @@ def link_sessions(sessions):
         if a in by_id and b in by_id and root(a) != root(b):
             parent[root(a)] = root(b)
 
-    try:  # Codex's own record of the Claude transcripts it imported (cs --codex, /codex:transfer)
+    try:  # Codex's own record of the Claude transcripts it imported (s --codex, /codex:transfer)
         with open(os.path.join(CODEX_HOME, "external_agent_session_imports.json")) as f:
             records = json.load(f).get("records") or []
     except (OSError, ValueError):
@@ -1146,7 +1161,7 @@ def job_line(j, status, text, expiry):
 # ----------------------------------------------------------------- remote hosts
 
 def load_hosts(extra=None):
-    """label -> ssh destination, from ~/.config/cs/hosts plus any --host values."""
+    """label -> ssh destination, from ~/.config/s/hosts plus any --host values."""
     hosts = {}
     if os.path.exists(HOSTS_FILE):
         with open(HOSTS_FILE) as f:
@@ -1165,7 +1180,7 @@ def load_hosts(extra=None):
 def save_hosts(hosts):
     os.makedirs(os.path.dirname(HOSTS_FILE), exist_ok=True)
     with open(HOSTS_FILE, "w") as f:
-        f.write("# label  ssh-destination   (cs lists and resumes sessions on these hosts over ssh)\n")
+        f.write("# label  ssh-destination   (s lists and resumes sessions on these hosts over ssh)\n")
         for label, dest in hosts.items():
             f.write(f"{label} {dest}\n")
 
@@ -1176,7 +1191,7 @@ def ssh(dest, command, timeout=40, tty=False):
 
 
 def from_json(o, host):
-    """A session dict built from another machine's `cs --json` output."""
+    """A session dict built from another machine's `s --json` output."""
     s = dict(o)
     s["host"] = host
     for k, v in (("project_dir", ""), ("open_tools", {}), ("todo", None), ("last_said", None),
@@ -1199,13 +1214,13 @@ def remote_base(label, days):
 
 def start_remote(hosts, days):
     """Ask every host for its sessions in the background. Each answer lands in the cache as a
-    whole file, even if this cs has moved on, so a slow host is current again next time."""
+    whole file, even if this run has moved on, so a slow host is current again next time."""
     os.makedirs(os.path.join(CACHE_DIR, "remote"), exist_ok=True)
     script = 'ssh "$@" > "$0.tmp" 2> "$0.err" && mv "$0.tmp" "$0.json"'
     procs = {}
     for label, dest in hosts.items():
         base = remote_base(label, days)
-        argv = ["sh", "-c", script, base, *SSH_OPTS, dest, f"{REMOTE_CS} --json --local -a -d {int(days)}"]
+        argv = ["sh", "-c", script, base, *SSH_OPTS, dest, f"{REMOTE_S} --json --local -a -d {int(days)}"]
         try:
             procs[label] = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                             stderr=subprocess.DEVNULL, start_new_session=True)
@@ -1235,7 +1250,7 @@ def finish_remote(pending, wait=REMOTE_WAIT):
                     err = (f.read().strip().splitlines() or ["ssh failed"])[-1]
             except OSError:
                 err = "ssh failed"
-            note = f"cs is not installed there, run: cs hosts setup {label}" if "not found" in err else err
+            note = f"sessions is not installed there, run: s hosts setup {label}" if "not found" in err else err
         sessions, asof = [], None
         try:
             with open(base + ".json") as f:
@@ -1243,7 +1258,7 @@ def finish_remote(pending, wait=REMOTE_WAIT):
             asof = rel(iso(os.path.getmtime(base + ".json")))
         except (OSError, ValueError):
             if code == 0:
-                note = f"unexpected output, run: cs hosts setup {label}"
+                note = f"unexpected output, run: s hosts setup {label}"
         stale = code != 0 and sessions
         if code is None:
             note = (f"slow to answer, showing its sessions as of {asof}" if stale
@@ -1256,7 +1271,7 @@ def finish_remote(pending, wait=REMOTE_WAIT):
 
 def host_check(dest):
     try:
-        p = ssh(dest, f"{REMOTE_CS} --version 2>/dev/null || echo 'cs missing'; "
+        p = ssh(dest, f"{REMOTE_S} --version 2>/dev/null || echo 'sessions missing'; "
                       "if command -v tmux >/dev/null 2>&1 || [ -x /opt/homebrew/bin/tmux ]; "
                       "then echo tmux; else echo 'no tmux'; fi", timeout=15)
     except (subprocess.TimeoutExpired, OSError) as e:
@@ -1267,13 +1282,16 @@ def host_check(dest):
 
 
 def hosts_setup(label, dest):
-    """Copy this script to the host so it can answer `cs --json` and resume sessions."""
+    """Copy this script to the host so it can answer `s --json` and resume sessions."""
     me = os.path.realpath(__file__)
-    print(f"copying cs {VERSION} to {label} ({dest}) ...")
+    print(f"copying sessions {VERSION} to {label} ({dest}) ...")
     try:
         ssh(dest, "mkdir -p ~/.local/bin", timeout=20)
-        subprocess.run(["scp", "-q", *SSH_OPTS, me, f"{dest}:.local/bin/cs"], check=True, timeout=60)
-        p = ssh(dest, "chmod +x ~/.local/bin/cs && ~/.local/bin/cs --version && "
+        subprocess.run(["scp", "-q", *SSH_OPTS, me, f"{dest}:.local/bin/s"], check=True, timeout=60)
+        # the same tool's old name there (cs) goes; anything else called cs is left alone
+        p = ssh(dest, "chmod +x ~/.local/bin/s && ~/.local/bin/s --version && "
+                      "(grep -q 'mohammadnaraghi/claude-sessions' ~/.local/bin/cs 2>/dev/null && "
+                      "rm -f ~/.local/bin/cs && echo 'removed the old cs command'; true) && "
                       "(command -v python3 >/dev/null 2>&1 || echo 'warning: python3 missing there') && "
                       "if command -v tmux >/dev/null 2>&1 || [ -x /opt/homebrew/bin/tmux ]; "
                       "then echo 'tmux: installed'; "
@@ -1284,13 +1302,13 @@ def hosts_setup(label, dest):
     print((p.stdout or "") + (p.stderr or ""), end="")
     if p.returncode != 0:
         sys.exit("setup failed")
-    print(f"done. `cs` now includes {label}; `cs live` shows what runs there.")
+    print(f"done. `s` now includes {label}; `s live` shows what runs there.")
 
 
 def hosts_cmd(args, hosts):
     if not args:
         if not hosts:
-            print("no hosts configured. add one with:  cs hosts add studio user@hostname")
+            print("no hosts configured. add one with:  s hosts add studio user@hostname")
             return
         width = max(len(k) for k in hosts)
         for label, dest in hosts.items():
@@ -1302,7 +1320,7 @@ def hosts_cmd(args, hosts):
         label, dest = args[1], args[-1]
         hosts[label] = dest
         save_hosts(hosts)
-        print(f"added {label} -> {dest}\nnext: cs hosts setup {label}   (copies cs there)")
+        print(f"added {label} -> {dest}\nnext: s hosts setup {label}   (copies sessions there)")
     elif sub in ("rm", "remove") and len(args) == 2 and args[1] in hosts:
         del hosts[args[1]]
         save_hosts(hosts)
@@ -1310,12 +1328,12 @@ def hosts_cmd(args, hosts):
     elif sub == "setup" and len(args) == 2 and args[1] in hosts:
         hosts_setup(args[1], hosts[args[1]])
     else:
-        sys.exit("usage: cs hosts | cs hosts add LABEL user@host | cs hosts setup LABEL | cs hosts rm LABEL")
+        sys.exit("usage: s hosts | s hosts add LABEL user@host | s hosts setup LABEL | s hosts rm LABEL")
 
 
 # ----------------------------------------------------------------- sync (memories + configs)
 
-SYNC_STATE_DIR = os.path.expanduser("~/.config/cs/sync")
+SYNC_STATE_DIR = os.path.join(CONFIG_DIR, "sync")
 BACKUP_ROOT = os.path.join(CLAUDE_DIR, "backups")
 CONFIG_FILES = ("settings.json", "CLAUDE.md", "keybindings.json")
 CONFIG_DIRS = ("commands", "agents", "hooks", "skills")
@@ -1397,7 +1415,7 @@ def sync_paths(items):
 
 
 def claude_json_path():
-    return os.environ.get("CS_CLAUDE_JSON") or os.path.expanduser("~/.claude.json")
+    return env("CLAUDE_JSON") or os.path.expanduser("~/.claude.json")
 
 
 def mcp_bytes():
@@ -1467,7 +1485,7 @@ def unpack(data):
 
 def apply_changes(writes, deletes):
     """Write and delete on this machine, keeping a copy of anything replaced under ~/.claude/backups."""
-    stamp = datetime.now().strftime("cs-sync-%Y%m%d-%H%M%S")
+    stamp = datetime.now().strftime("sessions-sync-%Y%m%d-%H%M%S")
     backup = os.path.join(BACKUP_ROOT, stamp)
     result = {"written": [], "deleted": [], "backup": None}
 
@@ -1480,7 +1498,7 @@ def apply_changes(writes, deletes):
 
     def put(path, data, mtime):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".cs-tmp"
+        tmp = path + ".s-tmp"
         with open(tmp, "wb") as f:
             f.write(data)
         os.replace(tmp, path)
@@ -1616,18 +1634,18 @@ ACTION_STYLE = {"push": ("→", "32"), "pull": ("←", "36"), "merge": ("⇄", "
 
 def sync_cmd(label, dest, items, prefer, dry, yes, allow_delete, title):
     try:
-        p = subprocess.run(["ssh", *SSH_OPTS, dest, f"{REMOTE_CS} _export --items {','.join(items)}"],
+        p = subprocess.run(["ssh", *SSH_OPTS, dest, f"{REMOTE_S} _export --items {','.join(items)}"],
                            capture_output=True, timeout=120)
     except (subprocess.TimeoutExpired, OSError) as e:
         sys.exit(f"{label}: {e}")
     if p.returncode != 0:
         err = p.stderr.decode(errors="replace").strip().splitlines() or ["ssh failed"]
-        sys.exit(f"{label}: {err[-1]}\n(an older cs there? run: cs hosts setup {label})")
+        sys.exit(f"{label}: {err[-1]}\n(an older version there? run: s hosts setup {label})")
     try:
         extra, remote = unpack(p.stdout)
         manifest = json.loads(extra["manifest.json"])
     except (KeyError, ValueError, OSError):
-        sys.exit(f"{label}: unexpected reply, run: cs hosts setup {label}")
+        sys.exit(f"{label}: unexpected reply, run: s hosts setup {label}")
     local = local_snapshot(items)
     try:
         with open(state_path(label)) as f:
@@ -1664,7 +1682,7 @@ def sync_cmd(label, dest, items, prefer, dry, yes, allow_delete, title):
     if rw or rd:
         payload = pack(rw, {"plan.json": json.dumps({"deletes": rd}).encode()})
         try:
-            q = subprocess.run(["ssh", *SSH_OPTS, dest, f"{REMOTE_CS} _import"], input=payload,
+            q = subprocess.run(["ssh", *SSH_OPTS, dest, f"{REMOTE_S} _import"], input=payload,
                                capture_output=True, timeout=120)
         except (subprocess.TimeoutExpired, OSError) as e:
             sys.exit(f"{label}: {e}")
@@ -1696,7 +1714,7 @@ def sync_cmd(label, dest, items, prefer, dry, yes, allow_delete, title):
 
 
 def export_cmd(items):
-    """`cs _export`: this machine's sync files as a tar.gz on stdout (run over ssh by the other side)."""
+    """`s _export`: this machine's sync files as a tar.gz on stdout (run over ssh by the other side)."""
     snap = local_snapshot(items)
     manifest = {"home": HOME, "version": VERSION,
                 "files": {k: {"hash": v["hash"], "mtime": v["mtime"]} for k, v in snap.items()}}
@@ -1704,7 +1722,7 @@ def export_cmd(items):
 
 
 def import_cmd():
-    """`cs _import`: apply a plan tar.gz from stdin, report as JSON (run over ssh by the other side)."""
+    """`s _import`: apply a plan tar.gz from stdin, report as JSON (run over ssh by the other side)."""
     extra, files = unpack(sys.stdin.buffer.read())
     plan = json.loads(extra.get("plan.json", b"{}"))
     print(json.dumps(apply_changes(files, plan.get("deletes", []))))
@@ -1885,6 +1903,12 @@ def print_list(view, start=0, count=None):
         fixed += 5 + len(gutter)
     if show_proj:
         fixed += pw + len(gutter)
+    if cols - fixed - 1 < 24 and show_proj:  # narrow terminal: the prompt matters more than the folder
+        show_proj, fixed = False, fixed - pw - len(gutter)
+    if cols - fixed - 1 < 24:
+        shrink = min(nw - 20, 24 - (cols - fixed - 1))
+        if shrink > 0:
+            nw, fixed = nw - shrink, fixed - shrink
     lw = max(16, cols - fixed - 1)
 
     def row(idx, flag, host, app, last, work, nm, proj, prompt, header=False):
@@ -1987,15 +2011,15 @@ def resume_command(s, extra, target=None, prepared=None):
     cwd = s.get("cwd") or "~"
     extra_q = " ".join(shlex.quote(e) for e in extra)
     if is_remote(s) and not (native and target == "claude"):
-        # the other machine's cs does the work there (importing, writing the transcript)
-        claude_cmd = (f"cs {s['id']} --{target} --local --no-tmux -a -d {int(DAYS)}"
+        # the other machine's s does the work there (importing, writing the transcript)
+        claude_cmd = (f"s {s['id']} --{target} --local --no-tmux -a -d {int(DAYS)}"
                       + (f" -- {extra_q}" if extra else ""))
     elif is_remote(s):
         claude_cmd = f"cd {shlex.quote(cwd)} && claude --resume {s['id']} {extra_q}".rstrip()
     else:
         argv = local_argv(s, target, extra, prepared)
         claude_cmd = f"cd {shlex.quote(cwd)} && {shlex.join(argv)}"
-    tname = "cs-" + s["id"][:8] + ("" if native else "-" + target)
+    tname = "s-" + s["id"][:8] + ("" if native else "-" + target)
     if is_remote(s):
         dest = HOSTS.get(s["host"], s["host"])
         # the usual homes of claude and tmux, in case the remote shell's own PATH lacks them
@@ -2004,7 +2028,7 @@ def resume_command(s, extra, target=None, prepared=None):
             inner, desc = path + f"exec tmux attach -t {shlex.quote(r['tmux'])}", f"tmux attach -t {r['tmux']}"
         elif TMUX_MODE != "never":
             # start claude inside a tmux session there: closing the laptop only detaches,
-            # and the next `cs` pick attaches to the same window
+            # and the next `s` pick attaches to the same window
             in_shell = f'"$SHELL" -lic {shlex.quote(path + claude_cmd)}'
             inner = (path + f"if command -v tmux >/dev/null 2>&1; then exec tmux new-session -A -s {tname} "
                      f"{shlex.quote(in_shell)}; else echo 'tmux is not installed there, so this session "
@@ -2070,13 +2094,13 @@ def show(s):
                     else c("32", "  ← opens") if m["id"] == s["id"] else "")
             print(f"  {'→' if i else ' '} {c(APP_COLOR.get(m['app'], ''), m['app'].ljust(6))} "
                   f"{when(m['last'])}  {fit(m['name'], 50).ljust(50)}  {c('2', m['id'][:8])}{mark}")
-        print(c("2", "  (cs <id> opens exactly that session)"))
+        print(c("2", "  (s <id> opens exactly that session)"))
     if s.get("broken"):
         print(c("33", f"Note     this Codex thread is {s['broken']}: every new message fails. Continue the "
                       f"conversation from its Claude session with --codex for a fresh thread on a summary."))
     print(c("1", "Resume   ") + resume_command(s, [])[1])
     other = "codex" if app_of(s) == "claude" else "claude"
-    print(c("1", APP_LABEL[other].split()[0].ljust(9)) + f"cs {s['id'][:8]} --{other}"
+    print(c("1", APP_LABEL[other].split()[0].ljust(9)) + f"s {s['id'][:8]} --{other}"
           + c("2", "   (imports the conversation into a Codex thread)" if other == "codex"
               else "   (Claude reads the Codex transcript and picks up)"))
 
@@ -2169,7 +2193,7 @@ def resume(s, extra, dry_run, target=None):
         print(c("2", f"→ {desc}"))
         if "tmux new-session" in desc:
             print(c("2", "   runs inside tmux: closing this terminal or the laptop only detaches it; "
-                         "ctrl-b d detaches on purpose, and picking it in cs again attaches"))
+                         "ctrl-b d detaches on purpose, and picking it in s again attaches"))
     if dry_run:
         return
     if not is_remote(s):
@@ -2304,7 +2328,7 @@ def print_mode(hits):
     per = max(5, lines - 4)
     print_list(hits, 0, per)
     if len(hits) > per:
-        print(c("2", f"… {len(hits) - per} more · run cs to page or filter, or cs -p | cat for all"))
+        print(c("2", f"… {len(hits) - per} more · run s to page or filter, or s -p | cat for all"))
 
 
 def self_update():
@@ -2318,14 +2342,14 @@ def self_update():
     m = re.search(rb'^VERSION = "([^"]+)"', data, re.M)
     new = m.group(1).decode() if m else "?"
     if new == VERSION:
-        print(f"cs {VERSION} is already the latest")
+        print(f"sessions {VERSION} is already the latest")
         return
     tmp = path + ".new"
     with open(tmp, "wb") as f:
         f.write(data)
     os.chmod(tmp, 0o755)
     os.replace(tmp, path)
-    print(f"cs updated {VERSION} -> {new}")
+    print(f"sessions updated {VERSION} -> {new}")
 
 
 def to_json(s):
@@ -2340,10 +2364,22 @@ def to_json(s):
             **{k: s.get(k) for k in keys}}
 
 
+def move_old_dirs():
+    """Carry the hosts list, sync state and cache over from the cs days, once."""
+    for old, new in OLD_DIRS:
+        if os.path.isdir(old) and not os.path.exists(new):
+            try:
+                os.makedirs(os.path.dirname(new), exist_ok=True)
+                shutil.move(old, new)
+            except OSError:
+                pass
+
+
 def main():
     global _ALL_SESSIONS, HOSTS, TMUX_MODE, DAYS
+    move_old_dirs()
     argv = sys.argv[1:]
-    if argv[:1] == ["_export"]:  # called over ssh by another machine's cs
+    if argv[:1] == ["_export"]:  # called over ssh by another machine's s
         items = argv[argv.index("--items") + 1].split(",") if "--items" in argv else ["memory", "configs"]
         export_cmd(items)
         return
@@ -2354,7 +2390,7 @@ def main():
     if "--" in argv:
         i = argv.index("--")
         argv, extra = argv[:i], argv[i + 1:]
-    ap = argparse.ArgumentParser(prog="cs", add_help=False)
+    ap = argparse.ArgumentParser(prog="s", add_help=False)
     ap.add_argument("rest", nargs="*")
     ap.add_argument("-d", "--days", type=int, default=14)
     ap.add_argument("-m", "--min", type=float, default=10)
@@ -2383,7 +2419,7 @@ def main():
         print(__doc__.strip())
         return
     if a.version:
-        print(f"cs {VERSION}")
+        print(f"sessions {VERSION}")
         return
     rest = a.rest
     if rest == ["update"]:
@@ -2400,12 +2436,12 @@ def main():
             prefer, allow_delete, title = a.prefer, True, "sync with"
         else:
             if len(rest) != 3 or rest[1] not in ("to", "from"):
-                sys.exit("usage: cs migrate to LABEL | cs migrate from LABEL")
+                sys.exit("usage: s migrate to LABEL | s migrate from LABEL")
             label = rest[2]
             prefer = "local" if rest[1] == "to" else "remote"
             allow_delete, title = False, f"migrate {rest[1]}"
         if not label or label not in hosts:
-            sys.exit("which host? " + (", ".join(hosts) if hosts else "none configured (cs hosts add ...)"))
+            sys.exit("which host? " + (", ".join(hosts) if hosts else "none configured (s hosts add ...)"))
         sync_cmd(label, hosts[label], items, prefer, a.dry_run, a.yes, allow_delete, title)
         return
     if a.all:
@@ -2422,7 +2458,7 @@ def main():
         if a.local:  # --local --host X: only the hosts named on the command line
             named = {h.partition("=")[0] for h in a.host}
             HOSTS = {k: v for k, v in HOSTS.items() if k in named}
-    # `cs show <id>` (the fzf preview runs it per line) needs no other machine if the id is here
+    # `s show <id>` (the fzf preview runs it per line) needs no other machine if the id is here
     lookup = rest[1] if rest[:1] in (["show"], ["path"]) and len(rest) == 2 and not rest[1].isdigit() else None
     pending = start_remote(HOSTS, a.days) if HOSTS and not lookup else None
     with ThreadPoolExecutor(max_workers=1) as ex:

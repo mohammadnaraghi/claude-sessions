@@ -1,25 +1,26 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="856" height="435" viewBox="0 0 856 435" font-family="SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12.6">
-<rect width="856" height="435" rx="10" fill="#1e1e2e"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="856" height="454" viewBox="0 0 856 454" font-family="SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12.6">
+<rect width="856" height="454" rx="10" fill="#1e1e2e"/>
 <path d="M10 0h836a10 10 0 0 1 10 10v28H0V10A10 10 0 0 1 10 0z" fill="#181825"/>
 <circle cx="20" cy="19" r="6" fill="#ff5f57"/><circle cx="40" cy="19" r="6" fill="#febc2e"/><circle cx="60" cy="19" r="6" fill="#28c840"/>
-<text x="428.0" y="24" text-anchor="middle" fill="#7f849c" font-size="12">cs show 2</text>
+<text x="428.0" y="24" text-anchor="middle" fill="#7f849c" font-size="12">s show 2</text>
 <text y="70"><tspan x="18.0" fill="#ffffff" font-weight="600" xml:space="preserve">Name</tspan><tspan x="86.4" fill="#ffffff" font-weight="600" xml:space="preserve">Nightly usage report</tspan></text>
-<text y="89"><tspan x="18.0" fill="#cdd6f4" xml:space="preserve">Session</tspan><tspan x="86.4" fill="#cdd6f4" xml:space="preserve">a1b2c3d4-0000-4000-8000-000000000002</tspan></text>
+<text y="89"><tspan x="18.0" fill="#cdd6f4" xml:space="preserve">Session</tspan><tspan x="86.4" fill="#cdd6f4" xml:space="preserve">a1b2c3d4-0000-4000-8000-000000000002</tspan><tspan x="375.2" fill="#f9e2af" xml:space="preserve">(Claude Code)</tspan></text>
 <text y="108"><tspan x="18.0" fill="#cdd6f4" xml:space="preserve">Project</tspan><tspan x="86.4" fill="#cdd6f4" xml:space="preserve">~/code/api</tspan><tspan x="177.6" fill="#cdd6f4" xml:space="preserve">(branch main)</tspan></text>
-<text y="127"><tspan x="18.0" fill="#cdd6f4" xml:space="preserve">Started</tspan><tspan x="86.4" fill="#cdd6f4" xml:space="preserve">Tue Oct 13 09:03</tspan><tspan x="238.4" fill="#cdd6f4" xml:space="preserve">Last active</tspan><tspan x="337.2" fill="#cdd6f4" xml:space="preserve">Fri Oct 16 18:30</tspan><tspan x="474.0" fill="#cdd6f4" xml:space="preserve">(1h ago)</tspan></text>
-<text y="146"><tspan x="18.0" fill="#cdd6f4" xml:space="preserve">Work</tspan><tspan x="86.4" fill="#cdd6f4" xml:space="preserve">2.7h total · 10-13 2.5h · 10-14 2m · 10-15 2m · 10-16 5m</tspan></text>
+<text y="127"><tspan x="18.0" fill="#cdd6f4" xml:space="preserve">Started</tspan><tspan x="86.4" fill="#cdd6f4" xml:space="preserve">Mon Oct 19 09:03</tspan><tspan x="238.4" fill="#cdd6f4" xml:space="preserve">Last active</tspan><tspan x="337.2" fill="#cdd6f4" xml:space="preserve">Thu Oct 22 14:02</tspan><tspan x="474.0" fill="#cdd6f4" xml:space="preserve">(1h ago)</tspan></text>
+<text y="146"><tspan x="18.0" fill="#cdd6f4" xml:space="preserve">Work</tspan><tspan x="86.4" fill="#cdd6f4" xml:space="preserve">2.7h total · 10-19 2.5h · 10-20 2m · 10-21 2m · 10-22 5m</tspan></text>
 <text y="165"><tspan x="18.0" fill="#cdd6f4" xml:space="preserve">Volume</tspan><tspan x="86.4" fill="#cdd6f4" xml:space="preserve">5 prompts · 13 replies · 5 tool calls · claude-opus-5-5</tspan></text>
 <text y="184"><tspan x="18.0" fill="#ffffff" font-weight="600" xml:space="preserve">Now</tspan><tspan x="86.4" fill="#f9e2af" xml:space="preserve">idle</tspan><tspan x="124.4" fill="#cdd6f4" xml:space="preserve">since 1h · context 63k tokens</tspan></text>
 <text y="203"><tspan x="86.4" fill="#7f849c" xml:space="preserve">asked</tspan><tspan x="139.6" fill="#cdd6f4" xml:space="preserve">also flag any customer whose errors doubled</tspan></text>
 <text y="222"><tspan x="86.4" fill="#7f849c" xml:space="preserve">said</tspan><tspan x="139.6" fill="#cdd6f4" xml:space="preserve">Added: customers whose error rate doubled day over day get a warning line. The 9:03 job pic…</tspan></text>
 <text y="241"><tspan x="18.0" fill="#ffffff" font-weight="600" xml:space="preserve">Cron jobs</tspan></text>
-<text y="260"><tspan x="33.2" fill="#cdd6f4" xml:space="preserve">↻ Every day at 9:03 AM · fires 3/7 (42%) · last Oct 15 09:03 · </tspan><tspan x="512.0" fill="#a6e3a1" font-weight="600" xml:space="preserve">live</tspan><tspan x="550.0" fill="#cdd6f4" xml:space="preserve">· expires Oct 20 18:00</tspan></text>
+<text y="260"><tspan x="33.2" fill="#cdd6f4" xml:space="preserve">↻ Every day at 9:03 AM · fires 3/7 (42%) · last Oct 21 09:03 · </tspan><tspan x="512.0" fill="#a6e3a1" font-weight="600" xml:space="preserve">live</tspan><tspan x="550.0" fill="#cdd6f4" xml:space="preserve">· expires Oct 26 13:32</tspan></text>
 <text y="279"><tspan x="56.0" fill="#7f849c" xml:space="preserve">Daily usage report: run the summary script and post to #metrics</tspan></text>
 <text y="298"><tspan x="18.0" fill="#ffffff" font-weight="600" xml:space="preserve">First prompts</tspan></text>
-<text y="317"><tspan x="33.2" fill="#cdd6f4" xml:space="preserve">Oct 13 15:30</tspan><tspan x="139.6" fill="#cdd6f4" xml:space="preserve">write a script that summarises yesterday's API usage per customer</tspan></text>
-<text y="336"><tspan x="33.2" fill="#cdd6f4" xml:space="preserve">Oct 13 16:07</tspan><tspan x="139.6" fill="#cdd6f4" xml:space="preserve">include error rates</tspan></text>
-<text y="355"><tspan x="33.2" fill="#cdd6f4" xml:space="preserve">Oct 13 16:45</tspan><tspan x="139.6" fill="#cdd6f4" xml:space="preserve">post it to the #metrics channel</tspan></text>
-<text y="374"><tspan x="33.2" fill="#cdd6f4" xml:space="preserve">Oct 13 17:22</tspan><tspan x="139.6" fill="#cdd6f4" xml:space="preserve">set up the daily report as a cron job</tspan></text>
-<text y="393"><tspan x="33.2" fill="#cdd6f4" xml:space="preserve">Oct 16 18:25</tspan><tspan x="139.6" fill="#cdd6f4" xml:space="preserve">also flag any customer whose errors doubled</tspan></text>
+<text y="317"><tspan x="33.2" fill="#cdd6f4" xml:space="preserve">Oct 19 11:02</tspan><tspan x="139.6" fill="#cdd6f4" xml:space="preserve">write a script that summarises yesterday's API usage per customer</tspan></text>
+<text y="336"><tspan x="33.2" fill="#cdd6f4" xml:space="preserve">Oct 19 11:40</tspan><tspan x="139.6" fill="#cdd6f4" xml:space="preserve">include error rates</tspan></text>
+<text y="355"><tspan x="33.2" fill="#cdd6f4" xml:space="preserve">Oct 19 12:17</tspan><tspan x="139.6" fill="#cdd6f4" xml:space="preserve">post it to the #metrics channel</tspan></text>
+<text y="374"><tspan x="33.2" fill="#cdd6f4" xml:space="preserve">Oct 19 12:55</tspan><tspan x="139.6" fill="#cdd6f4" xml:space="preserve">set up the daily report as a cron job</tspan></text>
+<text y="393"><tspan x="33.2" fill="#cdd6f4" xml:space="preserve">Oct 22 13:57</tspan><tspan x="139.6" fill="#cdd6f4" xml:space="preserve">also flag any customer whose errors doubled</tspan></text>
 <text y="412"><tspan x="18.0" fill="#ffffff" font-weight="600" xml:space="preserve">Resume</tspan><tspan x="86.4" fill="#cdd6f4" xml:space="preserve">cd ~/code/api &amp;&amp; claude --resume a1b2c3d4-0000-4000-8000-000000000002</tspan></text>
+<text y="431"><tspan x="18.0" fill="#ffffff" font-weight="600" xml:space="preserve">Codex</tspan><tspan x="86.4" fill="#cdd6f4" xml:space="preserve">s a1b2c3d4 --codex</tspan><tspan x="246.0" fill="#7f849c" xml:space="preserve">(imports the conversation into a Codex thread)</tspan></text>
 </svg>
