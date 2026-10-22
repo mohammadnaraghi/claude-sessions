@@ -45,7 +45,10 @@ class Session:
              "message": {"role": kind, "content": content}}
         if kind == "assistant":
             o["message"]["model"] = self.model
-            o["message"]["usage"] = {"input_tokens": 3, "cache_read_input_tokens": 40000 + 900 * self.n}
+            o["message"]["usage"] = {"input_tokens": 3, "cache_read_input_tokens": 40000 + 900 * self.n,
+                                     "cache_creation_input_tokens": 9000, "output_tokens": 2600,
+                                     "cache_creation": {"ephemeral_1h_input_tokens": 9000,
+                                                        "ephemeral_5m_input_tokens": 0}}
         o.update(extra)
         self.lines.append(o)
 
@@ -231,6 +234,9 @@ def codex_demo(tool, home):
                   active=minutes * 60.0, days={start.astimezone().strftime("%Y-%m-%d"): minutes * 60.0},
                   user=len(prompts), assistant=len(prompts), tools=3 * len(prompts), last_said=[ts(end), said],
                   links=list(links))
+        # Codex's token counts for the thread: uncached input, output, cache writes, cache reads
+        st["usage"] = {start.astimezone().strftime("%Y-%m-%d"):
+                       {"gpt-6-astra": [60_000 * len(prompts), 25_000 * len(prompts), 0, 0, 900_000 * len(prompts), 0]}}
         return dict(st, id=tid, path=None, project_dir="", host=None, app="codex")
 
     return [
@@ -475,6 +481,7 @@ def main():
         svg(tidy(capture(tool, ["jobs"])), "s jobs", os.path.join(OUT, "jobs.svg"))
         svg(tidy(capture(tool, ["sync", "studio", "-n"])), "s sync studio -n", os.path.join(OUT, "sync.svg"))
         svg(tidy(capture(tool, ["hosts"])), "s hosts", os.path.join(OUT, "hosts.svg"))
+        svg(tidy(capture(tool, ["cost", "-d", "14"], lines=60)), "s cost", os.path.join(OUT, "cost.svg"))
     finally:
         sleeper.kill()
         sleeper2.kill()

@@ -22,6 +22,11 @@ Usage
                          ("running", "cron", "claude" and "codex" filter by
                          status or tool, @studio by host)
   s show 3 | show <id>   details: work per day, prompts, live status, cron jobs
+  s cost                 what your sessions would cost at API list prices (not a
+                         subscription): bar charts per day, week and month,
+                         Claude Code vs Codex, by model, and the top sessions
+                         (last 30 days; -d 90 for longer, -a for every session,
+                         --top N). Subagents count toward their session.
   s live                 running sessions: what they are doing and how far along
   s jobs                 every in-session cron job and its status
   s path 3               print the session's directory  ->  cd "$(s path 3)"
@@ -59,7 +64,7 @@ Memories and configs between machines
   -n                             dry run      -y   apply without asking
 
 Options
-  -d, --days N           look back N days (default 14)
+  -d, --days N           look back N days (default 14; 30 for s cost)
   -m, --min N            minimum active minutes to be listed (default 10)
   -a, --all              list every session touched in the window
   --sort recent|active   order by last activity (default) or by work time
@@ -106,7 +111,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
 
-VERSION = "0.8.1"
+VERSION = "0.9.0"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/sessions/main/s"
 
 
@@ -119,7 +124,7 @@ PROJECTS = os.path.join(CLAUDE_DIR, "projects")
 CONFIG_DIR = env("CONFIG_DIR") or os.path.expanduser("~/.config/sessions")
 CACHE_DIR = env("CACHE_DIR") or os.path.expanduser("~/.cache/sessions")
 CACHE = os.path.join(CACHE_DIR, "cache.json")
-CACHE_VERSION = 5
+CACHE_VERSION = 6
 HOSTS_FILE = os.path.join(CONFIG_DIR, "hosts")
 HOME = env("HOME") or os.path.expanduser("~")  # override for tests
 HOME_RE = re.compile(r"^/(?:Users|home)/[^/]+")
@@ -127,7 +132,7 @@ GAP = 30 * 60  # silence longer than this is not counted as work
 CRON_LIFETIME = timedelta(days=7)  # recurring in-session jobs auto-expire after this
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 CODEX_CACHE = os.path.join(CACHE_DIR, "codex.json")
-CODEX_CACHE_VERSION = 3
+CODEX_CACHE_VERSION = 4
 # files Codex rewrites whenever a thread changes; while they look the same, the cached list is current
 CODEX_STAMP_FILES = ("session_index.jsonl", "state_*.sqlite", "thread_history_*.sqlite")
 HANDOFF_DIR = os.path.join(CACHE_DIR, "handoffs")  # transcripts handed from one tool to the other
@@ -226,7 +231,186 @@ def new_state():
                 assistant=0, tools=0, cwd=None, branch=None, model=None,
                 ai_title=None, custom_title=None, first_prompts=[], last_prompts=[],
                 last_prompt_ts=None, last_said=None, open_tools={}, ctx_tokens=0,
-                todo=None, jobs={}, pending_cron={}, links=[])
+                todo=None, jobs={}, pending_cron={}, links=[], usage={}, usage_recent={})
+
+
+# ----------------------------------------------------------------- cost
+
+# API list prices in $ per million tokens: input, output, short cache write (Anthropic 5 min,
+# OpenAI 30 min), long cache write (1 h / 12 h), cache read. From
+# platform.claude.com/docs/en/about-claude/pricing and developers.openai.com/api/docs/pricing.
+# This is what the tokens would cost on the pay-as-you-go API; subscriptions bill differently.
+PRICES_AS_OF = "2026-10-22"
+_OPUS_45 = (5, 25, 6.25, 10, 0.50)
+_OPUS_41 = (15, 75, 18.75, 30, 1.50)
+_SONNET_45 = (3, 15, 3.75, 6, 0.30)
+_FABLE_51 = (10, 50, 12.50, 20, 0.25)
+_FABLE_5 = (10, 50, 12.50, 20, 1.00)
+PRICES = {
+    "claude-fable-5-1": _FABLE_51, "claude-mythos-5-1": _FABLE_51,
+    "claude-fable-5": _FABLE_5, "claude-mythos-5": _FABLE_5,
+    "claude-opus-5-5": (4, 20, 5, 8, 0.20),
+    "claude-opus-5": _OPUS_45, "claude-opus-4-8": _OPUS_45, "claude-opus-4-7": _OPUS_45,
+    "claude-opus-4-6": _OPUS_45, "claude-opus-4-5": _OPUS_45,
+    "claude-opus-4-1": _OPUS_41, "claude-opus-4": _OPUS_41,
+    "claude-sonnet-5-5": (2, 10, 2.50, 4, 0.10), "claude-sonnet-5": (2, 10, 2.50, 4, 0.20),
+    "claude-sonnet-4-6": _SONNET_45, "claude-sonnet-4-5": _SONNET_45, "claude-sonnet-4": _SONNET_45,
+    "claude-haiku-5-5": (0.10, 0.50, 0.125, 0.20, 0.01), "claude-haiku-4-5": (1, 5, 1.25, 2, 0.10),
+    "claude-3-5-haiku": (0.80, 4, 1, 1.60, 0.08),
+    "gpt-6-astra": (10, 50, 12.50, 25, 1.00), "gpt-6.1-sol": (2, 10, 2.50, 5, 0.10),
+    "gpt-6-sol": (2, 10, 2.50, 5, 0.20), "gpt-6-luna": (0.10, 0.50, 0.125, 0.25, 0.01),
+    "gpt-5.6-sol": (4, 20, 5, 10, 0.40), "gpt-5.6-terra": (2, 12, 2.50, 5, 0.20),
+    "gpt-5.6-luna": (0.20, 1.20, 0.25, 0.50, 0.02), "gpt-5.5": (5, 30, 5, 5, 0.50),
+    "gpt-5.4": (2.50, 15, 2.50, 2.50, 0.25), "gpt-5.4-mini": (0.75, 4.50, 0.75, 0.75, 0.075),
+    "gpt-5.4-nano": (0.20, 1.25, 0.20, 0.20, 0.02), "gpt-5.3-codex": (1.75, 14, 1.75, 1.75, 0.175),
+}
+# a request whose prompt is over the threshold pays these rates for all of it
+LONG_PROMPT = {"claude-haiku-5-5": 100_000, "gpt": 272_000}
+LONG_PRICES = {
+    "claude-haiku-5-5": (0.50, 2.50, 0.625, 1, 0.05),
+    "gpt-6-astra": (20, 75, 25, 50, 2.00), "gpt-6.1-sol": (4, 15, 5, 10, 0.20),
+    "gpt-6-sol": (4, 15, 5, 10, 0.40), "gpt-6-luna": (0.20, 0.75, 0.25, 0.50, 0.02),
+    "gpt-5.6-sol": (8, 30, 10, 20, 0.80), "gpt-5.6-terra": (4, 18, 5, 10, 0.40),
+    "gpt-5.6-luna": (0.40, 1.80, 0.50, 1, 0.04), "gpt-5.5": (10, 45, 10, 10, 1.00),
+    "gpt-5.4": (5, 22.50, 5, 5, 0.50),
+}
+FAST_PRICES = {"claude-opus-5-5": (8, 40, 10, 16, 0.40), "claude-opus-5": (10, 50, 12.50, 20, 1.00),
+               "claude-opus-4-8": (10, 50, 12.50, 20, 1.00)}
+US_ONLY = 1.1  # inference_geo "us" on Claude 4.6 and later
+WEB_SEARCH = 0.01  # $ per Claude web search
+NO_US_PREMIUM = ("claude-opus-4-5", "claude-opus-4-1", "claude-opus-4", "claude-sonnet-4-5",
+                 "claude-sonnet-4", "claude-haiku-4-5", "claude-3-5-haiku")
+
+
+def base_model(model):
+    return re.sub(r"-\d{8}$", "", model or "")  # claude-haiku-4-5-20251001 -> claude-haiku-4-5
+
+
+def long_threshold(model):
+    return LONG_PROMPT.get(model) or (LONG_PROMPT["gpt"] if model.startswith("gpt") else None)
+
+
+def price_of(key):
+    """$ per million tokens for a usage key 'model|flag|flag', or None when the model is unknown."""
+    model, *flags = key.split("|")
+    if "fast" in flags:
+        p = FAST_PRICES.get(model)
+    elif "long" in flags:
+        p = LONG_PRICES.get(model) or PRICES.get(model)
+    else:
+        p = PRICES.get(model)
+    if p and "us" in flags and model not in NO_US_PREMIUM:
+        p = tuple(x * US_ONLY for x in p)
+    return p
+
+
+def cost_of(key, vec):
+    """vec = [input, output, short cache write, long cache write, cache read, web searches]."""
+    p = price_of(key)
+    if p is None:
+        return None
+    return sum(v * x for v, x in zip(vec[:5], p)) / 1e6 + vec[5] * WEB_SEARCH
+
+
+def add_usage(usage, day, key, vec, sign=1):
+    cur = usage.setdefault(day, {}).setdefault(key, [0] * 6)
+    for i, v in enumerate(vec):
+        cur[i] += sign * v
+
+
+def merge_usage(*usages):
+    out = {}
+    for usage in usages:
+        for day, keys in (usage or {}).items():
+            for key, vec in keys.items():
+                add_usage(out, day, key, vec)
+    return out
+
+
+def note_claude_usage(st, o, ts):
+    """Count one Claude response's tokens. Claude Code writes a response once per content block,
+    each line carrying its usage, so a repeat replaces the earlier count instead of adding to it."""
+    msg = o.get("message") or {}
+    u, model = msg.get("usage"), base_model(msg.get("model"))
+    if not u or not model or model.startswith("<"):
+        return
+    write = u.get("cache_creation_input_tokens") or 0
+    ttl = u.get("cache_creation") or {}
+    long_write = ttl.get("ephemeral_1h_input_tokens") or 0
+    vec = [u.get("input_tokens") or 0, u.get("output_tokens") or 0, max(0, write - long_write), long_write,
+           u.get("cache_read_input_tokens") or 0, (u.get("server_tool_use") or {}).get("web_search_requests") or 0]
+    flags = [model]
+    limit = long_threshold(model)
+    if limit and vec[0] + write + vec[4] > limit:
+        flags.append("long")
+    if u.get("speed") == "fast":
+        flags.append("fast")
+    if u.get("inference_geo") == "us":
+        flags.append("us")
+    key, day = "|".join(flags), ts.astimezone().strftime("%Y-%m-%d")
+    mid = (msg.get("id") or "") + (o.get("requestId") or "")
+    recent = st.setdefault("usage_recent", {})
+    if mid and mid in recent:
+        add_usage(st["usage"], *recent[mid], sign=-1)
+    add_usage(st["usage"], day, key, vec)
+    if mid:
+        recent[mid] = [day, key, vec]
+        while len(recent) > 12:
+            del recent[next(iter(recent))]
+
+
+def first_session_id(path):
+    """The session an older top-level agent-*.jsonl transcript belongs to."""
+    try:
+        with open(path, errors="ignore") as f:
+            for _, line in zip(range(20), f):
+                try:
+                    sid = json.loads(line).get("sessionId")
+                except ValueError:
+                    continue
+                if sid:
+                    return sid
+    except OSError:
+        pass
+    return None
+
+
+def parse_usage(path, st):
+    """Only the token usage of a subagent's transcript, read from where the last read stopped."""
+    with open(path, "rb") as f:
+        f.seek(st["offset"])
+        data = f.read()
+    end = data.rfind(b"\n")
+    if end < 0:
+        return st
+    st["offset"] += end + 1
+    for line in data[: end + 1].split(b"\n"):
+        if b'"usage"' not in line or b'"assistant"' not in line:
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        ts = parse_ts(o.get("timestamp"))
+        if o.get("type") == "assistant" and ts:
+            note_claude_usage(st, o, ts)
+    return st
+
+
+def usage_cost(usage, days=None):
+    """-> (total $, {key: $}, {key: tokens} for models without a known price)."""
+    total, by_key, unknown = 0.0, {}, {}
+    for day, keys in (usage or {}).items():
+        if days is not None and day not in days:
+            continue
+        for key, vec in keys.items():
+            c = cost_of(key, vec)
+            if c is None:
+                unknown[key.split("|")[0]] = unknown.get(key.split("|")[0], 0) + sum(vec[:5])
+                continue
+            total += c
+            by_key[key.split("|")[0]] = by_key.get(key.split("|")[0], 0) + c
+    return total, by_key, unknown
 
 
 def add_links(st, pattern, text):
@@ -326,6 +510,7 @@ def parse(path, st):
                 st["last_prompts"] = (st["last_prompts"] + [item])[-4:]
         else:
             st["assistant"] += 1
+            note_claude_usage(st, o, ts)
             if not st["model"] and msg.get("model"):
                 st["model"] = msg["model"]
             usage = msg.get("usage") or {}
@@ -380,14 +565,42 @@ def load_sessions(days, rescan=False):
             cache = {}
     cache["__version__"] = CACHE_VERSION
     horizon = (datetime.now() - timedelta(days=days)).timestamp()
-    out, dirty = [], False
+    out, dirty, sub_usage = [], False, {}
     if not os.path.isdir(PROJECTS):
         return out
+
+    def read_subagent(path, parent):
+        """A subagent's or workflow agent's transcript: its tokens count toward the session that ran it."""
+        nonlocal dirty
+        s = os.stat(path)
+        entry = cache.get(path)
+        if entry and entry["mtime"] == s.st_mtime and entry["size"] == s.st_size:
+            st = entry["st"]
+        elif s.st_mtime < horizon and not entry:
+            return
+        else:
+            st = (entry["st"] if entry and entry["size"] <= s.st_size
+                  else {"offset": 0, "usage": {}, "usage_recent": {}, "parent": parent or first_session_id(path)})
+            st = parse_usage(path, st)
+            cache[path] = {"mtime": s.st_mtime, "size": s.st_size, "st": st}
+            dirty = True
+        if st.get("parent") and st["usage"]:
+            sub_usage[st["parent"]] = merge_usage(sub_usage.get(st["parent"]), st["usage"])
+
     for proj in os.scandir(PROJECTS):
         if not proj.is_dir():
             continue
         for ent in os.scandir(proj.path):
-            if not ent.name.endswith(".jsonl") or ent.name.startswith("agent-"):
+            if ent.is_dir() and re.fullmatch(UUID, ent.name):  # <session id>/subagents/...
+                for root, _, files in os.walk(ent.path):
+                    for fn in files:
+                        if fn.endswith(".jsonl"):
+                            read_subagent(os.path.join(root, fn), ent.name)
+                continue
+            if ent.name.startswith("agent-") and ent.name.endswith(".jsonl"):  # older layout
+                read_subagent(ent.path, None)
+                continue
+            if not ent.name.endswith(".jsonl"):
                 continue
             s = ent.stat()
             entry = cache.get(ent.path)
@@ -403,6 +616,9 @@ def load_sessions(days, rescan=False):
             if not st["first"]:
                 continue
             out.append(dict(id=ent.name[:-6], path=ent.path, project_dir=proj.name, host=None, app="claude", **st))
+    for s in out:
+        if s["id"] in sub_usage:
+            s["usage"] = merge_usage(s.get("usage"), sub_usage[s["id"]])
     if dirty:
         os.makedirs(CACHE_DIR, exist_ok=True)
         tmp = CACHE + ".tmp"
@@ -518,11 +734,63 @@ def item_text(item):
     return "\n".join(x.get("text", "") for x in item.get("content") or [] if x.get("type") == "text")
 
 
+def read_rollout(path):
+    """A Codex session file's text; Codex compresses older ones with zstd."""
+    for p in (path, path + ".zst") if path else ():
+        if not os.path.isfile(p):
+            continue
+        with open(p, "rb") as f:
+            data = f.read()
+        if p.endswith(".zst"):
+            try:
+                from compression import zstd  # Python 3.14+
+                data = zstd.decompress(data)
+            except ImportError:
+                if not shutil.which("zstd"):
+                    return None
+                data = subprocess.run(["zstd", "-dcq"], input=data, capture_output=True).stdout
+        return data.decode("utf-8", "ignore")
+    return None
+
+
+def codex_usage(path, model=None):
+    """Tokens per day and model from a Codex session file's running totals (token_count events)."""
+    usage, prev = {}, None
+    text = read_rollout(path)
+    for line in (text or "").splitlines():
+        if '"turn_context"' not in line and '"token_count"' not in line:
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        payload = o.get("payload") or {}
+        if o.get("type") == "turn_context":
+            model = payload.get("model") or model
+            continue
+        info = payload.get("info") or {}
+        total, last, ts = info.get("total_token_usage"), info.get("last_token_usage") or {}, parse_ts(o.get("timestamp"))
+        if payload.get("type") != "token_count" or not total or not ts or not model:
+            continue
+        cur = [total.get(k) or 0 for k in ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+                                           "output_tokens")]
+        delta = [c - p for c, p in zip(cur, prev)] if prev and all(c >= p for c, p in zip(cur, prev)) else cur
+        prev = cur
+        if not any(delta):
+            continue
+        inp, cached, write, out = delta
+        key = model + ("|long" if (last.get("input_tokens") or 0) > (long_threshold(model) or 1e18) else "")
+        add_usage(usage, ts.astimezone().strftime("%Y-%m-%d"), key,
+                  [max(0, inp - cached - write), out, write, 0, cached, 0])
+    return usage
+
+
 def codex_state(srv, t):
     """A Codex thread summarised into the same fields a Claude transcript gets."""
     st = new_state()
     st.update(cwd=t.get("cwd"), model=t.get("model"), ai_title=t.get("name") or None,
               branch=(t.get("gitInfo") or {}).get("branch"))
+    st["usage"] = codex_usage(t.get("path"), t.get("model"))
     turns, cursor = [], None
     while len(turns) < 5000:
         params = {"threadId": t["id"], "limit": 50, "itemsView": "full", "sortDirection": "asc"}
@@ -863,6 +1131,7 @@ def merge_rows(sessions):
             for d, v in (m.get("days") or {}).items():
                 days[d] = days.get(d, 0) + v
         row = dict(latest)
+        row.update(usage=merge_usage(*(m.get("usage") for m in members)))
         row.update(days=days, active=sum(m.get("active") or 0 for m in members),
                    user=sum(m.get("user") or 0 for m in members), first=first.get("first"),
                    first_prompts=first.get("first_prompts") or [],
@@ -1196,7 +1465,8 @@ def from_json(o, host):
     s["host"] = host
     for k, v in (("project_dir", ""), ("open_tools", {}), ("todo", None), ("last_said", None),
                  ("ctx_tokens", 0), ("last_prompt_ts", None), ("branch", None), ("model", None),
-                 ("app", "claude"), ("group", None), ("chain", None), ("broken", None)):
+                 ("app", "claude"), ("group", None), ("chain", None), ("broken", None),
+                 ("usage", None)):
         s.setdefault(k, v)
     s["_running"] = o.get("running")
     s["_daemon"] = o.get("daemon")
@@ -2075,6 +2345,12 @@ def show(s):
     print(f"Volume   {s['user']} prompts · {s['assistant']} replies"
           + (f" · {s['tools']} tool calls" if s.get("tools") is not None else "")
           + (f" · {s['model']}" if s.get("model") else ""))
+    if s.get("usage"):
+        total, by_model, unknown = usage_cost(s["usage"])
+        parts = " · ".join(f"{m} {money(v)}" for m, v in sorted(by_model.items(), key=lambda kv: -kv[1]))
+        print(c("1", f"Cost     {money(total)}") + c("2", " at API list prices")
+              + (f" · {parts}" if len(by_model) > 1 else "")
+              + (c("33", "   no price known for " + ", ".join(unknown)) if unknown else ""))
     lb = live_block(s, indent="")
     if lb:
         print(c("1", "Now      ") + lb[0])
@@ -2162,6 +2438,102 @@ def jobs_view(sessions):
         rest = cols - (9 + 3 + 24 + 3 + 12 + 3 + 12 + 3 + nw + 3) - 1
         print(f"{st}   {sched:<24}   {text or ('fired' if j['fires'] else '-'):<12}   {last:<12}   "
               f"{c('1', fit(label(s), nw).ljust(nw))}   {fit(j.get('prompt') or '', max(10, rest))}")
+
+
+BLOCKS = " ▏▎▍▌▋▊▉"
+
+
+def money(x):
+    return f"${x:,.0f}" if x >= 10_000 else f"${x:,.2f}"
+
+
+def bar(value, scale, width):
+    """value as a run of block characters, in eighths of a cell, out of width cells for scale."""
+    eighths = int(round(value / scale * width * 8)) if scale > 0 else 0
+    return "█" * (eighths // 8) + (BLOCKS[eighths % 8] if eighths % 8 else "")
+
+
+def cost_chart(title, rows, label_w):
+    """rows = [(label, {"claude": $, "codex": $})]: one stacked bar per row, Claude then Codex."""
+    cols, _ = term()
+    amount_w = 11
+    width = max(10, min(70, cols - label_w - amount_w - 6))
+    scale = max([sum(v.values()) for _, v in rows] + [0])
+    print(c("1", title))
+    for label, v in rows:
+        total = sum(v.values())
+        claude, codex = bar(v.get("claude", 0), scale, width), bar(v.get("codex", 0), scale, width)
+        shown = len(claude) + len(codex)
+        cells = c(APP_COLOR["claude"], claude) + c(APP_COLOR["codex"], codex) + " " * max(0, width - shown)
+        amount = money(total) if total else c("2", "–")
+        print(f"  {label:<{label_w}}  {cells}  {amount:>{amount_w}}")
+    print()
+
+
+def cost_view(rows, days, remote_notes, top):
+    today = datetime.now().date()
+    window = [(today - timedelta(days=i)).isoformat() for i in range(days - 1, -1, -1)]
+    in_window = set(window)
+    per_day = {d: {"claude": 0.0, "codex": 0.0} for d in window}
+    by_model, unknown, ranked = {}, {}, []
+    for s in rows:
+        spent = 0.0
+        for day, keys in (s.get("usage") or {}).items():
+            if day not in in_window:
+                continue
+            for key, vec in keys.items():
+                model, cost = key.split("|")[0], cost_of(key, vec)
+                if cost is None:
+                    unknown[model] = unknown.get(model, 0) + sum(vec[:5])
+                    continue
+                per_day[day]["codex" if model.startswith("gpt") else "claude"] += cost
+                by_model[model] = by_model.get(model, 0) + cost
+                spent += cost
+        if spent > 0:
+            ranked.append((spent, s))
+    total = sum(sum(v.values()) for v in per_day.values())
+    where = ", ".join(["this machine"] + sorted({s["host"] for s in rows if s.get("host") and s.get("usage")}))
+    print(c("1", f"Cost at API list prices · last {days} days · {where}"))
+    print(c("2", "what these tokens would cost on the pay-as-you-go API; a subscription is billed differently"))
+    for note in remote_notes:
+        print(c("33", note))
+    legend = c(APP_COLOR["claude"], "█ Claude Code") + "  " + c(APP_COLOR["codex"], "█ Codex")
+    print(f"{money(total)} in total · {money(total / days)} a day on average   {legend}\n")
+    if days <= 62:
+        cost_chart("Per day", [(datetime.fromisoformat(d).strftime("%a %b %d"), per_day[d]) for d in window], 10)
+    weeks, months = {}, {}
+    for d in window:
+        date = datetime.fromisoformat(d).date()
+        monday = date - timedelta(days=date.weekday())
+        for bucket, key in ((weeks, monday), (months, (date.year, date.month))):
+            agg = bucket.setdefault(key, {"claude": 0.0, "codex": 0.0})
+            for tool, v in per_day[d].items():
+                agg[tool] += v
+    cost_chart("Per week", [((f"{m:%b %d}" + " – " + f"{m + timedelta(days=6):%b %d}"), v)
+                            for m, v in sorted(weeks.items())], 15)
+    cost_chart("Per month", [(datetime(y, mo, 1).strftime("%B %Y"), v) for (y, mo), v in sorted(months.items())], 15)
+    if by_model:
+        print(c("1", "By model"))
+        width = max(len(m) for m in by_model)
+        for model, v in sorted(by_model.items(), key=lambda kv: -kv[1]):
+            share = 100 * v / total if total else 0
+            print(f"  {model:<{width}}  {money(v):>11}  {c('2', f'{share:3.0f}%')}")
+        print()
+    if ranked:
+        ranked.sort(key=lambda r: -r[0])
+        shown = ranked if top <= 0 else ranked[:top]
+        print(c("1", "Sessions") + c("2", f"  ({len(shown)} of {len(ranked)}; -a for all)" if len(shown) < len(ranked) else ""))
+        nw = min(40, max(len(name(s)) for _, s in shown))
+        where_of = lambda s: fit(short_project(s), 18) + (f" @{s['host']}" if s.get("host") else "")  # noqa: E731
+        pw = max(len(where_of(s)) for _, s in shown)
+        for i, (spent, s) in enumerate(shown, 1):
+            print(f"  {i:>3}  {money(spent):>11}  {c(APP_COLOR.get(app_of(s), ''), f'{app_cell(s):<7}')}  "
+                  f"{fit(name(s), nw):<{nw}}  {c('2', f'{where_of(s):<{pw}}')}  {c('2', s['id'][:8])}")
+        print()
+    if unknown:
+        print(c("33", "No price known for: " + ", ".join(f"{m} ({ktok(t)} tokens)" for m, t in unknown.items())))
+    print(c("2", f"List prices as of {PRICES_AS_OF}, from Anthropic's and OpenAI's pricing pages. Calls Claude Code makes "
+                 "for itself (titles, compaction) are not in its transcripts, so Claude totals can read a little low."))
 
 
 def resume(s, extra, dry_run, target=None):
@@ -2377,7 +2749,8 @@ def self_update():
 def to_json(s):
     keys = ("id", "app", "cwd", "project_dir", "host", "branch", "custom_title", "ai_title", "first", "last",
             "active", "active_win", "days", "user", "assistant", "tools", "model", "ctx_tokens", "todo",
-            "last_said", "last_prompt_ts", "first_prompts", "last_prompts", "group", "chain", "broken")
+            "last_said", "last_prompt_ts", "first_prompts", "last_prompts", "group", "chain", "broken",
+            "usage")
     return {"name": name(s), "last_prompt": last_prompt(s), "running": running_of(s), "doing": doing(s),
             "daemon": daemon_of(s),
             "jobs": [dict({k: v for k, v in j.items() if k != "sessions"}, status=st, fires_text=text,
@@ -2402,7 +2775,8 @@ def main():
         argv, extra = argv[:i], argv[i + 1:]
     ap = argparse.ArgumentParser(prog="s", add_help=False)
     ap.add_argument("rest", nargs="*")
-    ap.add_argument("-d", "--days", type=int, default=14)
+    ap.add_argument("-d", "--days", type=int, default=None)
+    ap.add_argument("--top", type=int, default=10)
     ap.add_argument("-m", "--min", type=float, default=10)
     ap.add_argument("-a", "--all", action="store_true")
     ap.add_argument("--sort", choices=["recent", "active"], default="recent")
@@ -2432,6 +2806,8 @@ def main():
         print(f"sessions {VERSION}")
         return
     rest = a.rest
+    if a.days is None:
+        a.days = 30 if rest[:1] == ["cost"] else 14
     if rest == ["update"]:
         self_update()
         return
@@ -2491,6 +2867,11 @@ def main():
             print(c("33", n), file=sys.stderr)
     view = select(merge_rows(sessions), a.days, a.min, a.sort)  # one row per conversation
 
+    if rest == ["cost"]:
+        old = sorted({s["host"] for s in sessions if s.get("host") and s.get("usage") is None})
+        notes = [f"{h}: no cost data from there yet (run: s hosts setup {h})" for h in old]
+        cost_view(merge_rows(sessions), a.days, notes, 0 if a.all else a.top)
+        return
     if rest == ["live"]:
         pool = select(sessions, a.days, 0, "recent")
         if a.json:

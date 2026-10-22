@@ -32,6 +32,8 @@ even when it lives on another computer, and in either tool.
   between Claude Code and Codex, with nothing to run once it is set up.
 - **See what is running.** `s live` shows each open session: busy or idle, what you asked,
   what it is doing this second, the last thing it said, and how far through its checklist it is.
+- **What it costs.** `s cost` charts what your sessions would cost at API list prices, per
+  day, week and month, by model and by session, across both tools and all your machines.
 - **Scheduled jobs, tracked.** Sessions that set up cron jobs are marked. You see the schedule,
   how many times it has fired, and whether it is still alive or died with the terminal.
 - **Your other computers too.** Add a machine once; its sessions join the list. Resuming one
@@ -89,6 +91,26 @@ done, expired, cancelled, or dead because the terminal closed.
 `s show 2` gives you the full picture before you jump in: when it started, how the work was
 spread across days, the first and latest prompts, its jobs, and the exact command that resumes
 it.
+
+## What it costs
+
+<p align="center">
+  <img src="docs/cost.svg" width="100%" alt="s cost: spend per day, week and month, by model and by session">
+</p>
+
+`s cost` shows what your sessions would cost at API list prices: what the same tokens would
+cost on the pay-as-you-go API, not what a subscription charges you. You get a bar chart per
+day, per week and per month (Claude Code and Codex in different colours), the split by model,
+and the sessions that cost the most, on every machine you added. It covers the last 30 days;
+`-d 90` looks further back, `-a` lists every session, and `s show 3` gives one session's cost.
+
+The numbers are worked out from the tokens each response used, as recorded in the transcripts:
+input, output, both cache-write lengths and cache reads, fast mode, US-only inference and web
+searches, at Anthropic's and OpenAI's published per-model prices (the date is printed with the
+result). A session's subagents and workflow agents count toward it, and a conversation that
+moved between the tools counts once. Checked against the cost snapshots Claude Code keeps in its
+transcripts, they match to the cent for most sessions; the calls Claude Code makes for itself, such as titles and compaction, are not in its
+transcripts, so Claude totals can read slightly low.
 
 ## Claude Code and Codex
 
@@ -207,6 +229,7 @@ deletes nothing.
 | `s tiktok` | filter by any word; resumes at once if only one matches |
 | `s running` · `s cron` · `s @studio` | only running sessions, only sessions with jobs, only one machine |
 | `s codex` · `s claude` | only Codex sessions · only Claude Code sessions |
+| `s cost` | spend at API list prices per day, week and month, by model and session |
 | `s live` | what every open session is doing |
 | `s jobs` | every scheduled job and its status |
 | `s show 3` | the full story of one session |
