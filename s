@@ -106,23 +106,18 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/sessions/main/s"
 
 
 def env(name):
-    """SESSIONS_<name>, or the CS_<name> spelling from when this tool was called cs."""
-    return os.environ.get("SESSIONS_" + name) or os.environ.get("CS_" + name)
+    return os.environ.get("SESSIONS_" + name)
 
 
 CLAUDE_DIR = env("CLAUDE_DIR") or os.path.expanduser("~/.claude")  # override for tests
 PROJECTS = os.path.join(CLAUDE_DIR, "projects")
 CONFIG_DIR = env("CONFIG_DIR") or os.path.expanduser("~/.config/sessions")
 CACHE_DIR = env("CACHE_DIR") or os.path.expanduser("~/.cache/sessions")
-# where this tool kept its files while it was called cs; moved over on first run
-OLD_DIRS = tuple((os.path.expanduser(old), new) for old, new, overridden in (
-    ("~/.config/cs", CONFIG_DIR, env("CONFIG_DIR")),
-    ("~/.cache/claude-sessions", CACHE_DIR, env("CACHE_DIR"))) if not overridden)
 CACHE = os.path.join(CACHE_DIR, "cache.json")
 CACHE_VERSION = 5
 HOSTS_FILE = os.path.join(CONFIG_DIR, "hosts")
@@ -1304,10 +1299,7 @@ def hosts_setup(label, dest):
                           'else echo "ai-bridge: copied; run ai-bridge setup there to share memory with Codex"; fi',
                     timeout=60)
             print((p.stdout or "") + (p.stderr or ""), end="")
-        # the same tool's old name there (cs) goes; anything else called cs is left alone
         p = ssh(dest, "chmod +x ~/.local/bin/s && ~/.local/bin/s --version && "
-                      "(grep -q 'mohammadnaraghi/claude-sessions' ~/.local/bin/cs 2>/dev/null && "
-                      "rm -f ~/.local/bin/cs && echo 'removed the old cs command'; true) && "
                       "(command -v python3 >/dev/null 2>&1 || echo 'warning: python3 missing there') && "
                       "if command -v tmux >/dev/null 2>&1 || [ -x /opt/homebrew/bin/tmux ]; "
                       "then echo 'tmux: installed'; "
@@ -2394,20 +2386,8 @@ def to_json(s):
             **{k: s.get(k) for k in keys}}
 
 
-def move_old_dirs():
-    """Carry the hosts list, sync state and cache over from the cs days, once."""
-    for old, new in OLD_DIRS:
-        if os.path.isdir(old) and not os.path.exists(new):
-            try:
-                os.makedirs(os.path.dirname(new), exist_ok=True)
-                shutil.move(old, new)
-            except OSError:
-                pass
-
-
 def main():
     global _ALL_SESSIONS, HOSTS, TMUX_MODE, DAYS
-    move_old_dirs()
     argv = sys.argv[1:]
     if argv[:1] == ["_export"]:  # called over ssh by another machine's s
         items = argv[argv.index("--items") + 1].split(",") if "--items" in argv else ["memory", "configs"]

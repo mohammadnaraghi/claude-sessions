@@ -58,14 +58,6 @@ your `PATH` yet. Open a new terminal and type `s`.
 If you have [fzf](https://github.com/junegunn/fzf) installed, `s` uses it automatically for
 fuzzy search with a live preview.
 
-### Coming from `cs`?
-
-This tool used to be called `cs` (repository `claude-sessions`). Run the install line above
-once: it installs `s` and removes the old `cs`. Your machines list, sync state and cache move
-over by themselves the first time you run `s`, and `s hosts setup NAME` does the same switch on
-your other machines. Old `CS_*` environment variables keep working; the new names start with
-`SESSIONS_`.
-
 ## What is running right now
 
 <p align="center">

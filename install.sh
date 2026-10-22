@@ -8,7 +8,7 @@
 set -e
 
 BASE="https://raw.githubusercontent.com/mohammadnaraghi/sessions/main"
-BIN_DIR="${SESSIONS_BIN_DIR:-${CS_BIN_DIR:-$HOME/.local/bin}}"
+BIN_DIR="${SESSIONS_BIN_DIR:-$HOME/.local/bin}"
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "sessions needs python3 (3.8 or newer)." >&2
@@ -42,13 +42,6 @@ install_one() {
 
 install_one s
 install_one ai-bridge
-
-# This tool used to be called cs; remove that copy so there is one command. Anything else
-# named cs is left alone.
-if grep -q "mohammadnaraghi/claude-sessions" "$BIN_DIR/cs" 2>/dev/null; then
-  rm -f "$BIN_DIR/cs"
-  echo "removed the old cs command (your hosts, sync state and cache move over on the first run)"
-fi
 
 if grep -q ai-bridge "$HOME/.codex/hooks.json" 2>/dev/null; then
   "$BIN_DIR/ai-bridge" setup >/dev/null && echo "ai-bridge: setup refreshed"
